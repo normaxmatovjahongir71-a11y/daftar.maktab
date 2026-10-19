@@ -1,0 +1,15 @@
+[Unit]
+Description=Raqamli Daftar - Telegram Bot va Web Ilova
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/daftar.maktab
+ExecStart=/usr/bin/python3 bot.py
+Restart=always
+RestartSec=5
+EnvironmentFile=/var/www/daftar.maktab/.env
+
+[Install]
+WantedBy=multi-user.target
