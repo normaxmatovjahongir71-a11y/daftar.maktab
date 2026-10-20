@@ -24,6 +24,7 @@ from telegram import (
     Update, WebAppInfo, MenuButtonWebApp,
     KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 )
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     filters, ContextTypes
@@ -126,6 +127,16 @@ def serve_index():
     if index_path.exists():
         return send_file(index_path)
     return 'index.html topilmadi', 404
+
+
+@flask_app.route('/healthz', methods=['GET'])
+@flask_app.route('/ping', methods=['GET'])
+def health_check():
+    return jsonify({
+        'status': 'healthy',
+        'service': 'Raqamli Daftar Web & Telegram Bot',
+        'time': datetime.now().isoformat()
+    }), 200
 
 
 @flask_app.route('/uploads/<filename>')
@@ -403,6 +414,76 @@ def api_get_images():
 #                    TELEGRAM BOT HANDLERLARI
 # ══════════════════════════════════════════════════════════════
 
+def start_keep_alive():
+    """Render Web Servisining uxlab qolishining oldini olish uchun self-ping (Keep-Alive)."""
+    import time
+    import urllib.request
+
+    def _worker():
+        time.sleep(20)
+        logger.info("✅ Keep-alive monitoring ishga tushdi.")
+        while True:
+            try:
+                target_url = SITE_URL.strip() if (SITE_URL and SITE_URL.startswith('http')) else f"http://127.0.0.1:{PORT}"
+                ping_url = f"{target_url.rstrip('/')}/healthz"
+                req = urllib.request.Request(
+                    ping_url,
+                    headers={'User-Agent': 'DaftarBot-KeepAlive/1.0'}
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    logger.debug(f"Keep-alive ping: {resp.status}")
+            except Exception as e:
+                logger.debug(f"Keep-alive ping xabari: {e}")
+            time.sleep(600)  # Har 10 daqiqada bir marta (Render 15 daqiqada uxlaydi)
+
+    t = threading.Thread(target=_worker, daemon=True, name="keep_alive_worker")
+    t.start()
+
+
+async def reply_safe(message_or_update, text: str, **kwargs):
+    """
+    Xabarni xavfsiz yuborish.
+    Agar Markdown parse xatosi yuz bersa, bot to'xtab qolmaydi va oddiy matn tarzida yuboradi.
+    """
+    msg = None
+    if hasattr(message_or_update, 'reply_text'):
+        msg = message_or_update
+    elif hasattr(message_or_update, 'message') and message_or_update.message:
+        msg = message_or_update.message
+
+    if not msg:
+        return None
+
+    try:
+        return await msg.reply_text(text, **kwargs)
+    except Exception as e:
+        err = str(e).lower()
+        if 'parse' in err or 'entity' in err:
+            clean_kwargs = {k: v for k, v in kwargs.items() if k != 'parse_mode'}
+            return await msg.reply_text(text, **clean_kwargs)
+        logger.error(f"reply_safe xatosi: {e}")
+        return None
+
+
+async def send_safe(bot, chat_id: int, text: str, **kwargs):
+    """bot.send_message uchun xavfsiz wrapper."""
+    try:
+        return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    except Exception as e:
+        err = str(e).lower()
+        if 'parse' in err or 'entity' in err:
+            clean_kwargs = {k: v for k, v in kwargs.items() if k != 'parse_mode'}
+            return await bot.send_message(chat_id=chat_id, text=text, **clean_kwargs)
+        logger.error(f"send_safe xatosi (chat {chat_id}): {e}")
+        return None
+
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Botning barcha kutilmagan xatolarini ushlash va botni to'xtamasdan ishlashini ta'minlash."""
+    err = context.error
+    logger.error(f"Telegram Bot xatoligi: {err}", exc_info=err)
+
+
 def get_admin_keyboard():
     """Adminlar uchun boshqaruv tugmalari."""
     keyboard = [
@@ -442,8 +523,10 @@ def get_main_keyboard(chat_id: int):
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Boshlash buyrug'i — Salomlashish va barcha qulay tugmalar."""
+    if not update.effective_chat:
+        return
     chat_id = update.effective_chat.id
-    user_first_name = update.effective_user.first_name or "Foydalanuvchi"
+    user_first_name = (update.effective_user.first_name if update.effective_user else None) or "Foydalanuvchi"
 
     teacher = db.get_teacher_by_chat_id(chat_id)
     student = db.get_student_by_chat_id(chat_id)
@@ -471,7 +554,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Kerakli bo'limni tanlang 👇"
     )
 
-    await update.message.reply_text(
+    await reply_safe(
+        update,
         text,
         parse_mode='Markdown',
         reply_markup=reply_markup
@@ -480,13 +564,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin boshqaruv panelini ochish — kodsiz to'g'ridan-to'g'ri admin qilish."""
+    if not update.effective_chat:
+        return
     chat_id = update.effective_chat.id
-    username = update.effective_user.username or update.effective_user.first_name
+    username = (update.effective_user.username if update.effective_user else None) or (update.effective_user.first_name if update.effective_user else "Admin")
 
     # Foydalanuvchini admin sifatida saqlash
     db.add_admin(chat_id, username)
 
-    await update.message.reply_text(
+    await reply_safe(
+        update,
         "👑 *ADMIN BOSHQARUV PANELIGA XUSH KELIBSIZ!*\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "Siz tizim administratori sifatida tanindingiz. "
@@ -552,7 +639,8 @@ async def send_schedule_view(chat_id, context, selected_day=None, message_id=Non
         except Exception:
             pass
 
-    await context.bot.send_message(
+    await send_safe(
+        context.bot,
         chat_id=chat_id,
         text=text,
         parse_mode='Markdown',
@@ -581,7 +669,8 @@ async def show_grades_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     student = db.get_student_by_chat_id(chat_id)
 
     if not student:
-        await update.message.reply_text(
+        await reply_safe(
+            update,
             "🔒 *Siz hali tizimga kirmagansiz!*\n\n"
             "O'z baholaringizni ko'rish uchun o'quvchi hisobingizga kiring:\n"
             "`/kirish login parol`\n\n"
@@ -592,7 +681,8 @@ async def show_grades_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     grades = db.get_grades(student['id'])
     if not grades:
-        await update.message.reply_text(
+        await reply_safe(
+            update,
             f"👤 *{student['name']}*, sizga hali baholar qo'yilmagan.\n"
             "O'qituvchi baho qo'yganda bu yerda ko'rishingiz mumkin! 🌟",
             parse_mode='Markdown'
@@ -634,14 +724,15 @@ async def show_grades_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if needed_fives > 0:
             text += f"💡 *Maslahat:* A'lochi (4.8+) bo'lish uchun ketma-ket yana *{needed_fives} ta «5»* olishingiz kerak! 💪"
 
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await reply_safe(update, text, parse_mode='Markdown')
 
 
 async def show_tasks_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Vazifalarni ko'rsatish."""
     tasks = db.get_tasks()
     if not tasks:
-        await update.message.reply_text(
+        await reply_safe(
+            update,
             "📝 *Hozircha faol uy vazifalari yo'q!*\nDam oling yoki mustaqil shug'ullaning. 🎉",
             parse_mode='Markdown'
         )
@@ -666,7 +757,7 @@ async def show_tasks_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Rasm avtomatik o'qituvchiga ko'rinadi va tekshiriladi. ✅"
     )
 
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await reply_safe(update, text, parse_mode='Markdown')
 
 
 async def show_exam_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -676,7 +767,8 @@ async def show_exam_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     exam_date_str = exam.get('date', '').strip()
 
     if not exam_name and not exam_date_str:
-        await update.message.reply_text(
+        await reply_safe(
+            update,
             "🏆 *Hozircha rejalashtirilgan imtihon belgilanmagan.*\n"
             "O'qituvchi imtihon sanasini kiritishi bilan bu yerda ko'rinadi.",
             parse_mode='Markdown'
@@ -703,7 +795,7 @@ async def show_exam_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await reply_safe(update, text, parse_mode='Markdown')
 
 
 async def show_profile_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -752,7 +844,7 @@ async def show_profile_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Login va parolingizni bilmasangiz, o'qituvchingizdan so'rang."
         )
 
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await reply_safe(update, text, parse_mode='Markdown')
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -775,7 +867,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📸 *Uyga vazifa rasmini yuborish:*\n"
         "Daftaringizni rasmga olib shunchaki botga yuborsangiz kifoya!"
     )
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await reply_safe(update, text, parse_mode='Markdown')
 
 
 async def cmd_chiqish(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -787,7 +879,8 @@ async def cmd_chiqish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
-    await update.message.reply_text(
+    await reply_safe(
+        update,
         "👋 Siz hisobingizdan muvaffaqiyatli chiqdingiz.\n"
         "Qayta kirish uchun `/kirish login parol` yuborishingiz mumkin.",
         reply_markup=get_main_keyboard(chat_id)
@@ -796,13 +889,14 @@ async def cmd_chiqish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_kirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
-        await update.message.reply_text("❌ Foydalanish: `/kirish login parol`", parse_mode='Markdown')
+        await reply_safe(update, "❌ Foydalanish: `/kirish login parol`", parse_mode='Markdown')
         return
     login, password = context.args[0], context.args[1]
     student = db.verify_student(login, password)
     if student:
         db.set_student_chat_id(login, update.effective_chat.id)
-        await update.message.reply_text(
+        await reply_safe(
+            update,
             f"✅ Xush kelibsiz, *{student['name']}*!\n\n"
             f"Har kuni 14:00 da baholaringiz hisoboti sizga yuboriladi.\n"
             f"Daftarni ochish uchun quyidagi tugmalardan foydalaning.",
@@ -814,18 +908,19 @@ async def cmd_kirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     else:
-        await update.message.reply_text("❌ Login yoki parol noto'g'ri.")
+        await reply_safe(update, "❌ Login yoki parol noto'g'ri.")
 
 
 async def cmd_oqituvchi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
-        await update.message.reply_text("❌ Foydalanish: `/oqituvchi login parol`", parse_mode='Markdown')
+        await reply_safe(update, "❌ Foydalanish: `/oqituvchi login parol`", parse_mode='Markdown')
         return
     login, password = context.args[0], context.args[1]
     teacher = db.verify_teacher(login, password)
     if teacher:
         db.set_teacher_chat_id(login, update.effective_chat.id)
-        await update.message.reply_text(
+        await reply_safe(
+            update,
             f"✅ O'qituvchi hisobiga kirdingiz (`{login}`)!\n\n"
             "Siz endi bot va veb-sayt orqali baholar, jadval, vazifalar va o'quvchilarni boshqarishingiz mumkin.",
             parse_mode='Markdown',
@@ -836,7 +931,7 @@ async def cmd_oqituvchi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     else:
-        await update.message.reply_text("❌ Login yoki parol noto'g'ri.")
+        await reply_safe(update, "❌ Login yoki parol noto'g'ri.")
 
 
 async def cmd_baholarim(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -847,18 +942,19 @@ async def cmd_oquvchi_qosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     teacher = db.get_teacher_by_chat_id(chat_id)
     if not teacher:
-        await update.message.reply_text("❌ Siz o'qituvchi sifatida kirmagansiz. `/oqituvchi login parol`", parse_mode='Markdown')
+        await reply_safe(update, "❌ Siz o'qituvchi sifatida kirmagansiz. `/oqituvchi login parol`", parse_mode='Markdown')
         return
     if len(context.args) < 3:
-        await update.message.reply_text("❌ Foydalanish: `/oquvchi_qosh Ism login parol`", parse_mode='Markdown')
+        await reply_safe(update, "❌ Foydalanish: `/oquvchi_qosh Ism login parol`", parse_mode='Markdown')
         return
     name, login, password = context.args[0], context.args[1], context.args[2]
     if len(password) < 4:
-        await update.message.reply_text("❌ Parol kamida 4 belgidan iborat bo'lishi kerak.")
+        await reply_safe(update, "❌ Parol kamida 4 belgidan iborat bo'lishi kerak.")
         return
     result = db.create_student(name, login, password)
     if result:
-        await update.message.reply_text(
+        await reply_safe(
+            update,
             f"✅ *O'quvchi muvaffaqiyatli qo'shildi!*\n\n"
             f"👤 Ism: *{name}*\n"
             f"🔑 Login: `{login}`\n"
@@ -867,18 +963,18 @@ async def cmd_oquvchi_qosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
     else:
-        await update.message.reply_text(f"❌ '{login}' login allaqachon band.")
+        await reply_safe(update, f"❌ '{login}' login allaqachon band.")
 
 
 async def cmd_oquvchilar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     teacher = db.get_teacher_by_chat_id(chat_id)
     if not teacher:
-        await update.message.reply_text("❌ Bu buyruq faqat o'qituvchilar uchun.")
+        await reply_safe(update, "❌ Bu buyruq faqat o'qituvchilar uchun.")
         return
     students = db.get_students()
     if not students:
-        await update.message.reply_text("📭 O'quvchilar hali kiritilmagan.")
+        await reply_safe(update, "📭 O'quvchilar hali kiritilmagan.")
         return
     text = "👨‍🎓 *O'QUVCHILAR RO'YXATI:*\n━━━━━━━━━━━━━━━━━━━━━━\n"
     for i, s in enumerate(students, 1):
@@ -887,17 +983,17 @@ async def cmd_oquvchilar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         connected = "🟢 (Telegram ulangan)" if s.get('telegram_chat_id') else "⚪"
         text += f"*{i}. {s['name']}* (`{s['login']}`)\n"
         text += f"   └── O'rtacha: *{avg_str}* | {connected}\n\n"
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await reply_safe(update, text, parse_mode='Markdown')
 
 
 async def cmd_baho(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     teacher = db.get_teacher_by_chat_id(chat_id)
     if not teacher:
-        await update.message.reply_text("❌ Bu buyruq faqat o'qituvchilar uchun.")
+        await reply_safe(update, "❌ Bu buyruq faqat o'qituvchilar uchun.")
         return
     if len(context.args) < 3:
-        await update.message.reply_text("❌ Foydalanish: `/baho login fan baho(2-5)`\nMasalan: `/baho ali Matematika 5`", parse_mode='Markdown')
+        await reply_safe(update, "❌ Foydalanish: `/baho login fan baho(2-5)`\nMasalan: `/baho ali Matematika 5`", parse_mode='Markdown')
         return
     login, subject = context.args[0], context.args[1]
     try:
@@ -905,15 +1001,16 @@ async def cmd_baho(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if grade < 2 or grade > 5:
             raise ValueError()
     except ValueError:
-        await update.message.reply_text("❌ Baho 2 dan 5 gacha bo'lishi kerak.")
+        await reply_safe(update, "❌ Baho 2 dan 5 gacha bo'lishi kerak.")
         return
     student = db.get_student_by_login(login)
     if not student:
-        await update.message.reply_text(f"❌ '{login}' loginli o'quvchi topilmadi.")
+        await reply_safe(update, f"❌ '{login}' loginli o'quvchi topilmadi.")
         return
     db.add_grade(student['id'], subject, grade)
     emoji = _grade_emoji(grade)
-    await update.message.reply_text(
+    await reply_safe(
+        update,
         f"✅ *Baho qo'yildi!*\n\n"
         f"👤 O'quvchi: *{student['name']}*\n"
         f"📘 Fan: *{subject}*\n"
@@ -926,13 +1023,13 @@ async def cmd_rasmlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     teacher = db.get_teacher_by_chat_id(chat_id)
     if not teacher:
-        await update.message.reply_text("❌ Bu bo'lim faqat o'qituvchilar uchun.")
+        await reply_safe(update, "❌ Bu bo'lim faqat o'qituvchilar uchun.")
         return
     images = db.get_all_images()
     if not images:
-        await update.message.reply_text("📭 Hali o'quvchilar tomonidan rasm yuklanmagan.")
+        await reply_safe(update, "📭 Hali o'quvchilar tomonidan rasm yuklanmagan.")
         return
-    await update.message.reply_text(f"🖼 *Oxirgi yuklangan daftarlar rasmlari (jami {len(images)} ta):*", parse_mode='Markdown')
+    await reply_safe(update, f"🖼 *Oxirgi yuklangan daftarlar rasmlari (jami {len(images)} ta):*", parse_mode='Markdown')
     for img in images[:6]:
         img_path = UPLOADS_DIR / img['image_path']
         if img_path.exists():
@@ -946,15 +1043,18 @@ async def cmd_rasmlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Matnli tugmalar bosilganda ishlaydigan markaziy handler."""
-    text = update.message.text.strip() if update.message.text else ""
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
 
     if text in ["📓 Daftarni ochish (Sayt)", "Daftarni ochish", "Sayt", "sayt", "Daftar"]:
         if SITE_URL.startswith('https://'):
             markup = InlineKeyboardMarkup([[InlineKeyboardButton("📓 Daftarni ochish (Web App)", web_app=WebAppInfo(url=SITE_URL))]])
-            await update.message.reply_text("📓 Daftarni ochish uchun quyidagi tugmani bosing:", reply_markup=markup)
+            await reply_safe(update, "📓 Daftarni ochish uchun quyidagi tugmani bosing:", reply_markup=markup)
         else:
             markup = InlineKeyboardMarkup([[InlineKeyboardButton("🌐 Saytga o'tish (Brauzer)", url=SITE_URL)]])
-            await update.message.reply_text(
+            await reply_safe(
+                update,
                 f"📓 *Raqamli Daftar veb-sayti:*\n\n"
                 f"🔗 Sayt manzili: {SITE_URL}\n\n"
                 f"💡 _Sayt kompyuter yoki telefon brauzerida to'liq ishlaydi. Telegram ichida Web App bo'lib ochilishi uchun domen HTTPS bo'lishi kerak._",
@@ -970,7 +1070,8 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif text in ["🏆 Imtihonlar", "Imtihon", "imtihon"]:
         await show_exam_view(update, context)
     elif text in ["📷 Rasm yuklash (Uy ishi)", "📷 Rasm yuborish", "Rasm"]:
-        await update.message.reply_text(
+        await reply_safe(
+            update,
             "📸 *Uyga vazifa daftarini yuborish:*\n\n"
             "Daftaringizni oching, uyga vazifa yozilgan betini rasmga oling va to'g'ridan-to'g'ri ushbu botga rasm tarzida yuboring!\n\n"
             "Bot rasmni qabul qilib, o'qituvchingizga avtomatik yetkazadi! 🚀",
@@ -984,7 +1085,7 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.effective_chat.id
     if text == "/cancel":
         admin_states.pop(chat_id, None)
-        await update.message.reply_text("❌ Amal bekor qilindi.", reply_markup=get_main_keyboard(chat_id))
+        await reply_safe(update, "❌ Amal bekor qilindi.", reply_markup=get_main_keyboard(chat_id))
         return
 
     if chat_id in admin_states and db.is_admin(chat_id):
@@ -994,12 +1095,13 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
             if len(parts) >= 3:
                 name, login, password = parts[0], parts[1], parts[2]
                 if len(password) < 4:
-                    await update.message.reply_text("❌ Parol kamida 4 belgidan iborat bo'lishi kerak. Qayta urinib ko'ring:")
+                    await reply_safe(update, "❌ Parol kamida 4 belgidan iborat bo'lishi kerak. Qayta urinib ko'ring:")
                     return
                 sid = db.create_student(name, login, password)
                 admin_states.pop(chat_id, None)
                 if sid:
-                    await update.message.reply_text(
+                    await reply_safe(
+                        update,
                         f"✅ *Yangi o'quvchi hisobi yaratildi!*\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"👤 Ism: *{name}*\n"
@@ -1010,10 +1112,11 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
                         reply_markup=get_admin_keyboard()
                     )
                 else:
-                    await update.message.reply_text(f"❌ '{login}' login allaqachon band. Boshqa login tanlang.", reply_markup=get_admin_keyboard())
+                    await reply_safe(update, f"❌ '{login}' login allaqachon band. Boshqa login tanlang.", reply_markup=get_admin_keyboard())
                 return
             else:
-                await update.message.reply_text(
+                await reply_safe(
+                    update,
                     "⚠️ *Noto'g'ri format!*\n"
                     "Iltimos, quyidagicha ajratib yozing:\n"
                     "`Ism Familiya | login | parol`\n\n"
@@ -1028,12 +1131,13 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
             if len(parts) >= 2:
                 login, password = parts[0], parts[1]
                 if len(password) < 4:
-                    await update.message.reply_text("❌ Parol kamida 4 belgidan iborat bo'lishi kerak. Qayta urinib ko'ring:")
+                    await reply_safe(update, "❌ Parol kamida 4 belgidan iborat bo'lishi kerak. Qayta urinib ko'ring:")
                     return
                 tid = db.create_teacher(login, password)
                 admin_states.pop(chat_id, None)
                 if tid:
-                    await update.message.reply_text(
+                    await reply_safe(
+                        update,
                         f"✅ *Yangi o'qituvchi hisobi yaratildi!*\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"🔑 Login: `{login}`\n"
@@ -1043,10 +1147,11 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
                         reply_markup=get_admin_keyboard()
                     )
                 else:
-                    await update.message.reply_text(f"❌ '{login}' login allaqachon mavjud.", reply_markup=get_admin_keyboard())
+                    await reply_safe(update, f"❌ '{login}' login allaqachon mavjud.", reply_markup=get_admin_keyboard())
                 return
             else:
-                await update.message.reply_text(
+                await reply_safe(
+                    update,
                     "⚠️ *Noto'g'ri format!*\n"
                     "Iltimos, quyidagicha ajratib yozing:\n"
                     "`login | parol`\n\n"
@@ -1061,10 +1166,11 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         await cmd_admin(update, context)
     elif text in ["➕ O'quvchi ochish", "➕ O'quvchi yaratish"]:
         if not db.is_admin(chat_id):
-            await update.message.reply_text("❌ Bu bo'lim faqat adminlar uchun.")
+            await reply_safe(update, "❌ Bu bo'lim faqat adminlar uchun.")
             return
         admin_states[chat_id] = 'awaiting_student'
-        await update.message.reply_text(
+        await reply_safe(
+            update,
             "👤 *YANGI O'QUVCHI HISOBINI OCHISH*\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "O'quvchi ma'lumotlarini bitta xabarda quyidagicha yuboring:\n\n"
@@ -1076,10 +1182,11 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     elif text in ["👨‍🏫 O'qituvchi ochish", "👨‍🏫 O'qituvchi yaratish"]:
         if not db.is_admin(chat_id):
-            await update.message.reply_text("❌ Bu bo'lim faqat adminlar uchun.")
+            await reply_safe(update, "❌ Bu bo'lim faqat adminlar uchun.")
             return
         admin_states[chat_id] = 'awaiting_teacher'
-        await update.message.reply_text(
+        await reply_safe(
+            update,
             "👨‍🏫 *YANGI O'QITUVCHI HISOBINI OCHISH*\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "O'qituvchi login va parolini quyidagicha yuboring:\n\n"
@@ -1091,20 +1198,20 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     elif text in ["👥 O'qituvchilar ro'yxati"]:
         if not db.is_admin(chat_id):
-            await update.message.reply_text("❌ Bu bo'lim faqat adminlar uchun.")
+            await reply_safe(update, "❌ Bu bo'lim faqat adminlar uchun.")
             return
         teachers = db.get_teachers()
         if not teachers:
-            await update.message.reply_text("📭 Hali o'qituvchilar qo'shilmagan.")
+            await reply_safe(update, "📭 Hali o'qituvchilar qo'shilmagan.")
             return
         msg = "👨‍🏫 *O'QITUVCHILAR RO'YXATI:*\n━━━━━━━━━━━━━━━━━━━━━━\n"
         for idx, t in enumerate(teachers, 1):
             connected = "🟢 (Telegram ulangan)" if t.get('telegram_chat_id') else "⚪ (Telegram ulanmagan)"
             msg += f"*{idx}. Login:* `{t['login']}`\n   └── {connected}\n"
-        await update.message.reply_text(msg, parse_mode='Markdown')
+        await reply_safe(update, msg, parse_mode='Markdown')
     elif text in ["📊 Tizim statistikasi"]:
         if not db.is_admin(chat_id):
-            await update.message.reply_text("❌ Bu bo'lim faqat adminlar uchun.")
+            await reply_safe(update, "❌ Bu bo'lim faqat adminlar uchun.")
             return
         stats = db.get_stats()
         text_stats = (
@@ -1120,12 +1227,13 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"🌐 *Sayt holati:* Faol (Online)\n"
             f"🛡️ *Supabase Auth:* Ulangan ✅"
         )
-        await update.message.reply_text(text_stats, parse_mode='Markdown')
+        await reply_safe(update, text_stats, parse_mode='Markdown')
     elif text in ["🔑 Admin kodi"]:
         if not db.is_admin(chat_id):
-            await update.message.reply_text("❌ Bu bo'lim faqat adminlar uchun.")
+            await reply_safe(update, "❌ Bu bo'lim faqat adminlar uchun.")
             return
-        await update.message.reply_text(
+        await reply_safe(
+            update,
             f"🔑 *ADMIN MAXFIY KODI*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Joriy maxfiy kod: `{ADMIN_CODE}`\n\n"
@@ -1135,11 +1243,12 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     elif text in ["🔙 Asosiy menyu", "Asosiy menyu"]:
         admin_states.pop(chat_id, None)
-        await update.message.reply_text("🏠 Asosiy menyudasiz.", reply_markup=get_main_keyboard(chat_id))
+        await reply_safe(update, "🏠 Asosiy menyudasiz.", reply_markup=get_main_keyboard(chat_id))
     elif text in ["👨‍🏫 O'qituvchi boshqaruvi"]:
         teacher = db.get_teacher_by_chat_id(update.effective_chat.id)
         if teacher or db.is_admin(chat_id):
-            await update.message.reply_text(
+            await reply_safe(
+                update,
                 "👨‍🏫 *O'qituvchi Boshqaruvi:*\n\n"
                 "Buyruqlar:\n"
                 "• `/oquvchi_qosh Ism login parol` — O'quvchi kiritish\n"
@@ -1149,16 +1258,19 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode='Markdown'
             )
         else:
-            await update.message.reply_text("Siz o'qituvchi sifatida kirmagansiz. `/oqituvchi login parol`")
+            await reply_safe(update, "Siz o'qituvchi sifatida kirmagansiz. `/oqituvchi login parol`")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """O'quvchi rasm yuborganda uni saqlash va o'qituvchiga uzatish."""
+    if not update.message or not update.message.photo:
+        return
     chat_id = update.effective_chat.id
     student = db.get_student_by_chat_id(chat_id)
 
     if not student:
-        await update.message.reply_text(
+        await reply_safe(
+            update,
             "⚠️ *Rasm saqlanishi uchun avval o'quvchi hisobingizga kiring!*\n"
             "`/kirish login parol`",
             parse_mode='Markdown'
@@ -1177,7 +1289,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.save_image(task_id, student['id'], filename, photo.file_id)
 
     task_text = f" ({tasks[-1]['text'][:30]}...)" if tasks and task_id else ""
-    await update.message.reply_text(
+    await reply_safe(
+        update,
         f"✅ *Uyga vazifa rasmi qabul qilindi!*{task_text}\n"
         f"O'qituvchingiz daftaringizni tekshirishi uchun uzatildi. 📸👏",
         parse_mode='Markdown'
@@ -1215,26 +1328,30 @@ def _grade_emoji(grade):
 
 async def send_daily_grades(bot):
     logger.info("Kundalik baho bildirishnomasi ishga tushdi.")
-    students = db.get_students_with_chat_id()
-    for student in students:
-        today_grades = db.get_today_grades(student['id'])
-        if not today_grades:
-            continue
-        text = f"📊 *Bugungi baholaringiz — {student['name']}:*\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        for g in today_grades:
-            emoji = _grade_emoji(g['grade'])
-            text += f"📘 *{g['subject']}:* {emoji}\n"
-        avg = db.get_student_average(student['id'])
-        if avg:
-            text += f"\n📈 *Umumiy o'rtacha ball:* *{avg:.2f}*"
-        try:
-            await bot.send_message(
-                chat_id=student['telegram_chat_id'],
-                text=text,
-                parse_mode='Markdown'
-            )
-        except Exception as e:
-            logger.error(f"Bildirishnoma ({student['login']}): {e}")
+    try:
+        students = db.get_students_with_chat_id()
+        for student in students:
+            try:
+                today_grades = db.get_today_grades(student['id'])
+                if not today_grades:
+                    continue
+                text = f"📊 *Bugungi baholaringiz — {student['name']}:*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+                for g in today_grades:
+                    emoji = _grade_emoji(g['grade'])
+                    text += f"📘 *{g['subject']}:* {emoji}\n"
+                avg = db.get_student_average(student['id'])
+                if avg:
+                    text += f"\n📈 *Umumiy o'rtacha ball:* *{avg:.2f}*"
+                await send_safe(
+                    bot,
+                    chat_id=student['telegram_chat_id'],
+                    text=text,
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                logger.error(f"Bildirishnoma ({student.get('login')}): {e}")
+    except Exception as err:
+        logger.error(f"send_daily_grades umumiy xatosi: {err}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1246,19 +1363,37 @@ async def main():
         logger.error("BOT_TOKEN muhit o'zgaruvchisi topilmadi! .env faylni tekshiring.")
         return
 
+    # ── Keep-Alive fon jarayoni (Render Free tier uxlamasligi uchun) ──
+    start_keep_alive()
+
     # ── Flask Web Server ──
     flask_thread = threading.Thread(
         target=lambda: flask_app.run(
             host='0.0.0.0', port=PORT,
             debug=False, use_reloader=False
         ),
-        daemon=True
+        daemon=True,
+        name="flask_server"
     )
     flask_thread.start()
     logger.info(f"✅ Web server ishga tushdi: {SITE_URL}")
 
     # ── Telegram Bot ──
-    application = Application.builder().token(TOKEN).build()
+    request_config = HTTPXRequest(
+        connection_pool_size=10,
+        connect_timeout=20.0,
+        read_timeout=30.0,
+        write_timeout=20.0
+    )
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .request(request_config)
+        .build()
+    )
+
+    # Global xatoliklar ushlovchisi (bot to'xtab qolmasligi uchun)
+    application.add_error_handler(global_error_handler)
 
     application.add_handler(CommandHandler("admin", cmd_admin))
     application.add_handler(CommandHandler("start", cmd_start))
@@ -1280,6 +1415,11 @@ async def main():
 
     # Barcha menyu matnli tugmalari
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
+
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning(f"Webhook tozalashda: {e}")
 
     await application.initialize()
     await application.start()
