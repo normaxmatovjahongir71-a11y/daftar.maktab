@@ -497,6 +497,23 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     logger.error(f"Telegram Bot xatoligi: {err}", exc_info=err)
 
 
+def save_session_backup(chat_id: int, role: str, login: str):
+    """Sessiyani doimiy faylga saqlash (qayta yuklanganda ham saqlanib qolishi uchun)."""
+    try:
+        backup_file = BASE_DIR / 'sessions_backup.json'
+        sessions = {}
+        if backup_file.exists():
+            import json
+            with open(backup_file, 'r', encoding='utf-8') as f:
+                sessions = json.load(f)
+        sessions[str(chat_id)] = {'role': role, 'login': login, 'time': datetime.now().isoformat()}
+        with open(backup_file, 'w', encoding='utf-8') as f:
+            import json
+            json.dump(sessions, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"Sessiyani saqlashda ogohlantirish: {e}")
+
+
 def get_admin_keyboard():
     """Adminlar uchun boshqaruv tugmalari."""
     keyboard = [
@@ -526,7 +543,7 @@ def get_main_keyboard(chat_id: int):
     ]
 
     if is_admin_user:
-        keyboard.append([KeyboardButton("👑 Admin paneli")])
+        keyboard.append([KeyboardButton("👑 Admin paneli"), KeyboardButton("👨‍🏫 O'qituvchi boshqaruvi")])
     elif teacher:
         keyboard.append([KeyboardButton("👨‍🏫 O'qituvchi boshqaruvi")])
     
@@ -541,11 +558,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_first_name = (update.effective_user.first_name if update.effective_user else None) or "Foydalanuvchi"
 
+    is_admin_user = db.is_admin(chat_id)
     teacher = db.get_teacher_by_chat_id(chat_id)
     student = db.get_student_by_chat_id(chat_id)
 
     status_text = ""
-    if teacher:
+    if is_admin_user:
+        status_text = f"\n👑 *Siz tizim bosh administratori sifatida tizimdasiz* (`admin`)"
+    elif teacher:
         status_text = f"\n👨‍🏫 *Siz o'qituvchi sifatida tizimdasiz* (`{teacher['login']}`)"
     elif student:
         status_text = f"\n👨‍🎓 *Siz o'quvchi sifatida tizimdasiz*: *{student['name']}*"
@@ -584,6 +604,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Foydalanuvchini admin sifatida saqlash
     db.add_admin(chat_id, username)
+    save_session_backup(chat_id, 'admin', 'admin')
 
     await reply_safe(
         update,
@@ -908,6 +929,7 @@ async def cmd_kirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     student = db.verify_student(login, password)
     if student:
         db.set_student_chat_id(login, update.effective_chat.id)
+        save_session_backup(update.effective_chat.id, 'student', login)
         await reply_safe(
             update,
             f"✅ Xush kelibsiz, *{student['name']}*!\n\n"
@@ -932,6 +954,7 @@ async def cmd_oqituvchi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     teacher = db.verify_teacher(login, password)
     if teacher:
         db.set_teacher_chat_id(login, update.effective_chat.id)
+        save_session_backup(update.effective_chat.id, 'teacher', login)
         await reply_safe(
             update,
             f"✅ O'qituvchi hisobiga kirdingiz (`{login}`)!\n\n"

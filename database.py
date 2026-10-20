@@ -107,6 +107,33 @@ class Database:
         # Imtihon yozuvini yaratish
         if conn.execute('SELECT COUNT(*) FROM exam').fetchone()[0] == 0:
             conn.execute("INSERT INTO exam (name, date) VALUES ('', '')")
+
+        # Bosh administratorni (Jahongircmbk) doimiy saqlash
+        conn.execute(
+            'INSERT OR IGNORE INTO admins (telegram_chat_id, username) VALUES (?, ?)',
+            (7050627545, 'Jahongircmbk')
+        )
+        conn.execute(
+            "UPDATE teachers SET telegram_chat_id = ? WHERE login = 'admin' AND (telegram_chat_id IS NULL OR telegram_chat_id = '')",
+            (7050627545,)
+        )
+
+        # Sessiyalar zaxirasini tiklash (agar mavjud bo'lsa)
+        try:
+            backup_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sessions_backup.json')
+            if os.path.exists(backup_file):
+                import json
+                with open(backup_file, 'r', encoding='utf-8') as f:
+                    saved = json.load(f)
+                for cid_str, info in saved.items():
+                    cid = int(cid_str)
+                    if info.get('role') == 'student':
+                        conn.execute("UPDATE students SET telegram_chat_id = ? WHERE login = ?", (cid, info.get('login')))
+                    elif info.get('role') == 'teacher':
+                        conn.execute("UPDATE teachers SET telegram_chat_id = ? WHERE login = ?", (cid, info.get('login')))
+        except Exception:
+            pass
+
         conn.commit()
         conn.close()
 
@@ -163,6 +190,11 @@ class Database:
         row = conn.execute(
             'SELECT * FROM teachers WHERE telegram_chat_id = ?', (chat_id,)
         ).fetchone()
+        if not row and self.is_admin(chat_id):
+            row = conn.execute("SELECT * FROM teachers WHERE login = 'admin' LIMIT 1").fetchone()
+            if row:
+                conn.execute("UPDATE teachers SET telegram_chat_id = ? WHERE id = ?", (chat_id, row['id']))
+                conn.commit()
         conn.close()
         return dict(row) if row else None
 
@@ -196,7 +228,11 @@ class Database:
             conn.close()
             return False
 
+    SUPER_ADMINS = [7050627545]  # Doimiy bosh admin (Jahongircmbk)
+
     def is_admin(self, telegram_chat_id):
+        if telegram_chat_id and int(telegram_chat_id) in self.SUPER_ADMINS:
+            return True
         conn = self._conn()
         row = conn.execute(
             'SELECT id FROM admins WHERE telegram_chat_id = ?', (telegram_chat_id,)
