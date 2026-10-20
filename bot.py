@@ -42,7 +42,20 @@ load_dotenv()
 
 TOKEN = os.getenv('BOT_TOKEN', '8783586377:AAF8Bx_hp0cCLImSoMKu2HgjffYYGBiLIg4')
 PORT = int(os.getenv('PORT', '5000'))
-SITE_URL = os.getenv('SITE_URL', f'http://localhost:{PORT}')
+
+# Sayt manzili: Render yoki tashqi muhitdan avtomatik aniqlash
+SITE_URL = (
+    os.getenv('RENDER_EXTERNAL_URL')
+    or os.getenv('SITE_URL')
+    or 'https://daftar-maktab.onrender.com'
+).strip()
+
+if 'trycloudflare.com' in SITE_URL or 'localhost' in SITE_URL or '127.0.0.1' in SITE_URL:
+    render_ext = os.getenv('RENDER_EXTERNAL_URL')
+    if render_ext:
+        SITE_URL = render_ext
+    elif os.environ.get('RENDER'):
+        SITE_URL = 'https://daftar-maktab.onrender.com'
 TEACHER_LOGIN = os.getenv('TEACHER_LOGIN', 'admin')
 TEACHER_PASS = os.getenv('TEACHER_PASS', 'admin1234')
 ADMIN_CODE = os.getenv('ADMIN_CODE', '7777')
@@ -1049,15 +1062,25 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if text in ["📓 Daftarni ochish (Sayt)", "Daftarni ochish", "Sayt", "sayt", "Daftar"]:
         if SITE_URL.startswith('https://'):
-            markup = InlineKeyboardMarkup([[InlineKeyboardButton("📓 Daftarni ochish (Web App)", web_app=WebAppInfo(url=SITE_URL))]])
-            await reply_safe(update, "📓 Daftarni ochish uchun quyidagi tugmani bosing:", reply_markup=markup)
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📓 Daftarni ochish (Web App)", web_app=WebAppInfo(url=SITE_URL))],
+                [InlineKeyboardButton("🌐 Brauzerda ochish (Chrome / Safari)", url=SITE_URL)]
+            ])
+            await reply_safe(
+                update,
+                f"📓 *«Raqamli Daftar» tizimiga kirish:*\n\n"
+                f"🔗 *Sayt manzili:* `{SITE_URL}`\n\n"
+                f"Quyidagi tugmalardan birini bosing 👇",
+                parse_mode='Markdown',
+                reply_markup=markup
+            )
         else:
             markup = InlineKeyboardMarkup([[InlineKeyboardButton("🌐 Saytga o'tish (Brauzer)", url=SITE_URL)]])
             await reply_safe(
                 update,
                 f"📓 *Raqamli Daftar veb-sayti:*\n\n"
                 f"🔗 Sayt manzili: {SITE_URL}\n\n"
-                f"💡 _Sayt kompyuter yoki telefon brauzerida to'liq ishlaydi. Telegram ichida Web App bo'lib ochilishi uchun domen HTTPS bo'lishi kerak._",
+                f"💡 _Sayt kompyuter yoki telefon brauzerida to'liq ishlaydi._",
                 parse_mode='Markdown',
                 reply_markup=markup
             )
