@@ -96,7 +96,76 @@ class Database:
                 username TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS parents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_chat_id INTEGER UNIQUE NOT NULL,
+                first_name TEXT NOT NULL,
+                last_name TEXT DEFAULT '',
+                phone_number TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS student_parents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id INTEGER NOT NULL,
+                parent_id INTEGER,
+                relationship_type TEXT DEFAULT 'OTA_ONA',
+                invite_pin TEXT UNIQUE NOT NULL,
+                pin_expires_at TIMESTAMP NOT NULL,
+                is_verified BOOLEAN DEFAULT 0,
+                linked_at TIMESTAMP,
+                FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE,
+                FOREIGN KEY (parent_id) REFERENCES parents(id) ON DELETE CASCADE,
+                UNIQUE(student_id, parent_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS parent_notification_settings (
+                parent_id INTEGER PRIMARY KEY,
+                notify_grades BOOLEAN DEFAULT 1,
+                notify_attendance BOOLEAN DEFAULT 1,
+                notify_homework BOOLEAN DEFAULT 1,
+                notify_daily_digest BOOLEAN DEFAULT 1,
+                quiet_hours_start TEXT DEFAULT '22:00',
+                quiet_hours_end TEXT DEFAULT '07:00',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (parent_id) REFERENCES parents(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS attendance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id INTEGER NOT NULL,
+                lesson_date TEXT NOT NULL DEFAULT (DATE('now')),
+                slot_number INTEGER NOT NULL,
+                subject_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'KELDI',
+                minutes_late INTEGER DEFAULT 0,
+                note TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE,
+                UNIQUE(student_id, lesson_date, slot_number)
+            );
+
+            CREATE TABLE IF NOT EXISTS parent_notices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id INTEGER NOT NULL,
+                teacher_id INTEGER,
+                message TEXT NOT NULL,
+                is_urgent BOOLEAN DEFAULT 0,
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
+            );
         ''')
+
+        # Grades jadvaliga qo'shimcha ustunlarni tekshirish va qo'shish
+        try:
+            cols = [c[1] for c in conn.execute('PRAGMA table_info(grades)').fetchall()]
+            if 'comment' not in cols:
+                conn.execute("ALTER TABLE grades ADD COLUMN comment TEXT DEFAULT ''")
+            if 'teacher_name' not in cols:
+                conn.execute("ALTER TABLE grades ADD COLUMN teacher_name TEXT DEFAULT ''")
+        except Exception:
+            pass
         # Jadval kataklarini yaratish (Dush-Shanba, 7 dars)
         for day in range(1, 7):
             for slot in range(1, 8):
@@ -131,6 +200,8 @@ class Database:
                         conn.execute("UPDATE students SET telegram_chat_id = ? WHERE login = ?", (cid, info.get('login')))
                     elif info.get('role') == 'teacher':
                         conn.execute("UPDATE teachers SET telegram_chat_id = ? WHERE login = ?", (cid, info.get('login')))
+                    elif info.get('role') == 'parent':
+                        conn.execute("INSERT OR IGNORE INTO parents (telegram_chat_id, first_name) VALUES (?, ?)", (cid, 'Ota-ona'))
         except Exception:
             pass
 
@@ -435,7 +506,7 @@ class Database:
     def get_grades(self, student_id):
         conn = self._conn()
         rows = conn.execute(
-            '''SELECT g.id, g.student_id, g.subject, g.grade, g.created_at,
+            '''SELECT g.id, g.student_id, g.subject, g.grade, g.comment, g.teacher_name, g.created_at,
                       s.name as student_name
                FROM grades g
                JOIN students s ON g.student_id = s.id
@@ -449,7 +520,7 @@ class Database:
     def get_all_grades(self):
         conn = self._conn()
         rows = conn.execute(
-            '''SELECT g.id, g.student_id, g.subject, g.grade, g.created_at,
+            '''SELECT g.id, g.student_id, g.subject, g.grade, g.comment, g.teacher_name, g.created_at,
                       s.name as student_name, s.login as student_login
                FROM grades g
                JOIN students s ON g.student_id = s.id
@@ -458,11 +529,11 @@ class Database:
         conn.close()
         return [dict(r) for r in rows]
 
-    def add_grade(self, student_id, subject, grade):
+    def add_grade(self, student_id, subject, grade, comment='', teacher_name=''):
         conn = self._conn()
         conn.execute(
-            'INSERT INTO grades (student_id, subject, grade) VALUES (?, ?, ?)',
-            (student_id, subject, grade)
+            'INSERT INTO grades (student_id, subject, grade, comment, teacher_name) VALUES (?, ?, ?, ?, ?)',
+            (student_id, subject, grade, comment or '', teacher_name or '')
         )
         conn.commit()
         gid = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
@@ -543,6 +614,285 @@ class Database:
         conn = self._conn()
         rows = conn.execute(
             'SELECT id, name, login, telegram_chat_id FROM students WHERE telegram_chat_id IS NOT NULL'
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    # ==================== Ota-onalar Nazorati (Parental Control) ====================
+
+    def generate_student_pin(self, student_id):
+        """O'quvchi uchun ota-onani ulash PIN-kodini yaratish (7 kunlik)."""
+        import random
+        from datetime import datetime, timedelta
+        conn = self._conn()
+        # Mavjud faol kodni tekshirish
+        now_str = datetime.now().isoformat()
+        row = conn.execute(
+            '''SELECT invite_pin FROM student_parents 
+               WHERE student_id = ? AND is_verified = 0 AND pin_expires_at > ?
+               LIMIT 1''',
+            (student_id, now_str)
+        ).fetchone()
+        if row:
+            conn.close()
+            return row['invite_pin']
+
+        # Yangi noyob PIN generatsiya qilish
+        pin = f"MD-{random.randint(1000, 9999)}"
+        expires_at = (datetime.now() + timedelta(days=7)).isoformat()
+        
+        # Eski ishlatilmagan kodlarni tozalash va yangi kod kiritish
+        conn.execute('DELETE FROM student_parents WHERE student_id = ? AND is_verified = 0', (student_id,))
+        conn.execute(
+            '''INSERT INTO student_parents (student_id, invite_pin, pin_expires_at, is_verified)
+               VALUES (?, ?, ?, 0)''',
+            (student_id, pin, expires_at)
+        )
+        conn.commit()
+        conn.close()
+        return pin
+
+    def get_student_pin(self, student_id):
+        return self.generate_student_pin(student_id)
+
+    def verify_and_link_parent(self, invite_pin, telegram_chat_id, first_name, last_name='', phone_number=''):
+        """Ota-onani PIN-kod orqali farzandiga bog'lash."""
+        from datetime import datetime
+        pin = invite_pin.strip().upper()
+        now_str = datetime.now().isoformat()
+        conn = self._conn()
+
+        rel = conn.execute(
+            '''SELECT sp.id, sp.student_id, sp.pin_expires_at, sp.is_verified, s.name as student_name
+               FROM student_parents sp
+               JOIN students s ON sp.student_id = s.id
+               WHERE sp.invite_pin = ?''',
+            (pin,)
+        ).fetchone()
+
+        if not rel:
+            conn.close()
+            return {'success': False, 'error': "PIN-kod noto'g'ri. Qaytadan tekshirib yozing."}
+
+        if rel['is_verified']:
+            conn.close()
+            return {'success': False, 'error': "Ushbu taklif kodi allaqachon ishlatilgan!"}
+
+        if rel['pin_expires_at'] < now_str:
+            conn.close()
+            return {'success': False, 'error': "Ushbu PIN-kodning amal qilish muddati tugagan. O'qituvchidan yangi kod oling."}
+
+        # Ota-ona hisobini yaratish yoki olish
+        parent = conn.execute(
+            'SELECT id FROM parents WHERE telegram_chat_id = ?', (telegram_chat_id,)
+        ).fetchone()
+        if not parent:
+            conn.execute(
+                '''INSERT INTO parents (telegram_chat_id, first_name, last_name, phone_number)
+                   VALUES (?, ?, ?, ?)''',
+                (telegram_chat_id, first_name, last_name or '', phone_number or '')
+            )
+            parent_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        else:
+            parent_id = parent['id']
+            conn.execute(
+                'UPDATE parents SET first_name = ?, last_name = ? WHERE id = ?',
+                (first_name, last_name or '', parent_id)
+            )
+
+        # Xabarnoma sozlamalarini yaratish
+        conn.execute(
+            '''INSERT OR IGNORE INTO parent_notification_settings (parent_id)
+               VALUES (?)''',
+            (parent_id,)
+        )
+
+        # Aloqani tasdiqlash
+        conn.execute(
+            '''UPDATE student_parents
+               SET parent_id = ?, is_verified = 1, linked_at = ?
+               WHERE id = ?''',
+            (parent_id, now_str, rel['id'])
+        )
+        conn.commit()
+        conn.close()
+
+        return {
+            'success': True,
+            'student_id': rel['student_id'],
+            'student_name': rel['student_name'],
+            'parent_id': parent_id
+        }
+
+    def get_parent_by_chat_id(self, telegram_chat_id):
+        """Telegram chat ID orqali ota-ona va uning farzandlarini olish."""
+        conn = self._conn()
+        parent = conn.execute(
+            'SELECT * FROM parents WHERE telegram_chat_id = ?', (telegram_chat_id,)
+        ).fetchone()
+        if not parent:
+            conn.close()
+            return None
+
+        children = conn.execute(
+            '''SELECT s.id, s.name, s.login, sp.relationship_type, sp.linked_at
+               FROM student_parents sp
+               JOIN students s ON sp.student_id = s.id
+               WHERE sp.parent_id = ? AND sp.is_verified = 1''',
+            (parent['id'],)
+        ).fetchall()
+        conn.close()
+
+        res = dict(parent)
+        res['children'] = [dict(c) for c in children]
+        return res
+
+    def get_parents_for_student(self, student_id):
+        """O'quvchiga biriktirilgan barcha ota-onalarni sozlamalari bilan olish."""
+        conn = self._conn()
+        rows = conn.execute(
+            '''SELECT p.id as parent_id, p.telegram_chat_id, p.first_name, s.name as student_name,
+                      ns.notify_grades, ns.notify_attendance, ns.notify_homework, ns.notify_daily_digest,
+                      ns.quiet_hours_start, ns.quiet_hours_end
+               FROM student_parents sp
+               JOIN parents p ON sp.parent_id = p.id
+               JOIN students s ON sp.student_id = s.id
+               LEFT JOIN parent_notification_settings ns ON ns.parent_id = p.id
+               WHERE sp.student_id = ? AND sp.is_verified = 1''',
+            (student_id,)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def get_parent_settings(self, parent_id):
+        """Ota-onaning xabarnoma sozlamalarini olish."""
+        conn = self._conn()
+        row = conn.execute(
+            'SELECT * FROM parent_notification_settings WHERE parent_id = ?', (parent_id,)
+        ).fetchone()
+        if not row:
+            conn.execute(
+                'INSERT INTO parent_notification_settings (parent_id) VALUES (?)', (parent_id,)
+            )
+            conn.commit()
+            row = conn.execute(
+                'SELECT * FROM parent_notification_settings WHERE parent_id = ?', (parent_id,)
+            ).fetchone()
+        conn.close()
+        return dict(row)
+
+    def toggle_parent_setting(self, parent_id, setting_key):
+        """Xabarnoma sozlamasini yoqish/o'chirish."""
+        allowed_keys = ['notify_grades', 'notify_attendance', 'notify_homework', 'notify_daily_digest']
+        if setting_key not in allowed_keys:
+            return None
+        conn = self._conn()
+        conn.execute(
+            f'''UPDATE parent_notification_settings
+                SET {setting_key} = CASE WHEN {setting_key} = 1 THEN 0 ELSE 1 END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE parent_id = ?''',
+            (parent_id,)
+        )
+        conn.commit()
+        updated = conn.execute(
+            'SELECT * FROM parent_notification_settings WHERE parent_id = ?', (parent_id,)
+        ).fetchone()
+        conn.close()
+        return dict(updated) if updated else None
+
+    # ==================== Davomat (Attendance) ====================
+
+    def add_attendance(self, student_id, slot_number, subject_name, status, minutes_late=0, note='', lesson_date=None):
+        """Davomat yozuvini kiritish yoki yangilash."""
+        from datetime import date
+        ldate = lesson_date or date.today().isoformat()
+        status = status.upper().strip()
+        if status not in ['KELDI', 'KELMADI', 'KECHIKDI', 'SABABLI']:
+            status = 'KELDI'
+        conn = self._conn()
+        conn.execute(
+            '''INSERT INTO attendance (student_id, lesson_date, slot_number, subject_name, status, minutes_late, note)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(student_id, lesson_date, slot_number) DO UPDATE SET
+                   subject_name = excluded.subject_name,
+                   status = excluded.status,
+                   minutes_late = excluded.minutes_late,
+                   note = excluded.note,
+                   created_at = CURRENT_TIMESTAMP''',
+            (student_id, ldate, slot_number, subject_name, status, minutes_late, note)
+        )
+        conn.commit()
+        aid = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        conn.close()
+        return aid
+
+    def get_student_attendance(self, student_id, lesson_date=None):
+        """O'quvchining davomatini olish (sana bo'yicha yoki oxirgi kunlar)."""
+        conn = self._conn()
+        if lesson_date:
+            rows = conn.execute(
+                '''SELECT a.*, s.name as student_name
+                   FROM attendance a
+                   JOIN students s ON a.student_id = s.id
+                   WHERE a.student_id = ? AND a.lesson_date = ?
+                   ORDER BY a.slot_number ASC''',
+                (student_id, lesson_date)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                '''SELECT a.*, s.name as student_name
+                   FROM attendance a
+                   JOIN students s ON a.student_id = s.id
+                   WHERE a.student_id = ?
+                   ORDER BY a.lesson_date DESC, a.slot_number ASC
+                   LIMIT 20''',
+                (student_id,)
+            ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    # ==================== Ota-onaga Eslatmalar (Parent Notices) ====================
+
+    def add_parent_notice(self, student_id, teacher_id, message, is_urgent=False):
+        """O'qituvchidan ota-onaga shaxsiy ogohlantirish yoki xabar saqlash."""
+        conn = self._conn()
+        conn.execute(
+            '''INSERT INTO parent_notices (student_id, teacher_id, message, is_urgent)
+               VALUES (?, ?, ?, ?)''',
+            (student_id, teacher_id, message, 1 if is_urgent else 0)
+        )
+        conn.commit()
+        nid = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        conn.close()
+        return nid
+
+    def get_parent_notices(self, student_id):
+        conn = self._conn()
+        rows = conn.execute(
+            '''SELECT pn.*, t.login as teacher_login
+               FROM parent_notices pn
+               LEFT JOIN teachers t ON pn.teacher_id = t.id
+               WHERE pn.student_id = ?
+               ORDER BY pn.sent_at DESC
+               LIMIT 10''',
+            (student_id,)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def get_all_active_parents(self):
+        """Barcha tasdiqlangan ota-onalar va ularning farzandlari (Kunlik hisobot uchun)."""
+        conn = self._conn()
+        rows = conn.execute(
+            '''SELECT p.id as parent_id, p.telegram_chat_id, p.first_name,
+                      s.id as student_id, s.name as student_name,
+                      ns.notify_daily_digest, ns.quiet_hours_start, ns.quiet_hours_end
+               FROM student_parents sp
+               JOIN parents p ON sp.parent_id = p.id
+               JOIN students s ON sp.student_id = s.id
+               LEFT JOIN parent_notification_settings ns ON ns.parent_id = p.id
+               WHERE sp.is_verified = 1'''
         ).fetchall()
         conn.close()
         return [dict(r) for r in rows]

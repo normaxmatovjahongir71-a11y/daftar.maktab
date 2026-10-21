@@ -35,6 +35,10 @@ import pytz
 
 from database import Database
 from auth import create_token, verify_token
+from notifications import (
+    notify_parents_grade, notify_parents_attendance, notify_parents_notice,
+    send_daily_digests_job, get_parent_settings_markup
+)
 
 # ──────────────────────── Sozlamalar ────────────────────────
 
@@ -62,6 +66,9 @@ ADMIN_CODE = os.getenv('ADMIN_CODE', '7777')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY', 'sb_publishable_AJ9YQzNKEcDJGzaimxjn2g_IIOYPBne')
 
 admin_states = {}
+parent_link_states = {}
+bot_loop = None
+tg_application = None
 
 BASE_DIR = Path(__file__).parent
 TEMPLATES_DIR = BASE_DIR / 'templates'
@@ -352,15 +359,29 @@ def api_get_grades():
 
 @flask_app.route('/api/grades', methods=['POST'])
 def api_add_grade():
-    if not require_teacher_role():
+    teacher_user = require_teacher_role()
+    if not teacher_user:
         return error_response("Ruxsat yo'q", 403)
     data = request.get_json(silent=True) or {}
     student_id = data.get('student_id')
     subject = data.get('subject', '').strip()
     grade = data.get('grade')
+    comment = data.get('comment', '').strip()
     if not student_id or not subject or grade not in [2, 3, 4, 5]:
         return error_response('student_id, subject va grade (2-5) kerak.')
-    gid = db.add_grade(int(student_id), subject, int(grade))
+    teacher_name = teacher_user.get('login', "O'qituvchi")
+    gid = db.add_grade(int(student_id), subject, int(grade), comment=comment, teacher_name=teacher_name)
+
+    # Ota-onalarga avtomatik xabar
+    if tg_application and tg_application.bot and bot_loop:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                notify_parents_grade(tg_application.bot, db, int(student_id), subject, int(grade), teacher_name, comment),
+                bot_loop
+            )
+        except Exception as e:
+            logger.warning(f"Ota-onaga baho xabarini yuborishda: {e}")
+
     return jsonify({'success': True, 'id': gid})
 
 
@@ -370,6 +391,92 @@ def api_delete_grade(grade_id):
         return error_response("Ruxsat yo'q", 403)
     db.delete_grade(grade_id)
     return jsonify({'success': True})
+
+
+# ────────────── Ota-onalar Nazorati API ──────────────
+
+@flask_app.route('/api/parents/pin', methods=['GET', 'POST'])
+def api_parents_pin():
+    teacher_user = require_teacher_role()
+    if not teacher_user:
+        return error_response("Ruxsat yo'q", 403)
+    if request.method == 'GET':
+        student_id = request.args.get('student_id')
+        if not student_id:
+            return error_response('student_id kerak')
+        pin = db.get_student_pin(int(student_id))
+        return jsonify({'pin': pin, 'student_id': int(student_id)})
+    else:
+        data = request.get_json(silent=True) or {}
+        student_id = data.get('student_id')
+        if not student_id:
+            return error_response('student_id kerak')
+        pin = db.generate_student_pin(int(student_id))
+        return jsonify({'pin': pin, 'student_id': int(student_id)})
+
+
+@flask_app.route('/api/attendance', methods=['GET', 'POST'])
+def api_attendance():
+    if request.method == 'GET':
+        user = require_any_auth()
+        if not user:
+            return error_response("Avtorizatsiya kerak", 401)
+        student_id = request.args.get('student_id')
+        if user['role'] == 'student':
+            student_id = user['uid']
+        lesson_date = request.args.get('date')
+        if not student_id:
+            return error_response("student_id kerak")
+        records = db.get_student_attendance(int(student_id), lesson_date)
+        return jsonify({'attendance': records})
+    else:
+        teacher_user = require_teacher_role()
+        if not teacher_user:
+            return error_response("Ruxsat yo'q", 403)
+        data = request.get_json(silent=True) or {}
+        student_id = data.get('student_id')
+        slot = data.get('slot_number', 1)
+        subject = data.get('subject_name', '')
+        status = data.get('status', 'KELDI')
+        minutes = int(data.get('minutes_late', 0))
+        note = data.get('note', '')
+        if not student_id or not subject:
+            return error_response('student_id va subject_name kerak')
+        aid = db.add_attendance(int(student_id), int(slot), subject, status, minutes, note)
+
+        # Ota-onaga ogohlantirish
+        if tg_application and tg_application.bot and bot_loop:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    notify_parents_attendance(tg_application.bot, db, int(student_id), int(slot), subject, status, minutes, note),
+                    bot_loop
+                )
+            except Exception as e:
+                logger.warning(f"Ota-onaga davomat xabari: {e}")
+        return jsonify({'success': True, 'id': aid})
+
+
+@flask_app.route('/api/notices', methods=['POST'])
+def api_send_notice():
+    teacher_user = require_teacher_role()
+    if not teacher_user:
+        return error_response("Ruxsat yo'q", 403)
+    data = request.get_json(silent=True) or {}
+    student_id = data.get('student_id')
+    message = data.get('message', '').strip()
+    is_urgent = bool(data.get('is_urgent', False))
+    if not student_id or not message:
+        return error_response('student_id va message kerak')
+    nid = db.add_parent_notice(int(student_id), teacher_user.get('uid'), message, is_urgent)
+    if tg_application and tg_application.bot and bot_loop:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                notify_parents_notice(tg_application.bot, db, int(student_id), teacher_user.get('login', "O'qituvchi"), "", message, is_urgent),
+                bot_loop
+            )
+        except Exception as e:
+            logger.warning(f"Ota-onaga xabar yuborishda: {e}")
+    return jsonify({'success': True, 'id': nid})
 
 
 # ────────────── Rasmlar API ──────────────
@@ -519,7 +626,8 @@ def get_admin_keyboard():
     keyboard = [
         [KeyboardButton("➕ O'quvchi ochish"), KeyboardButton("👨‍🏫 O'qituvchi ochish")],
         [KeyboardButton("📋 O'quvchilar ro'yxati"), KeyboardButton("👥 O'qituvchilar ro'yxati")],
-        [KeyboardButton("⭐ Baho qo'yish"), KeyboardButton("📊 Tizim statistikasi")],
+        [KeyboardButton("⭐ Baho qo'yish"), KeyboardButton("⏰ Davomat belgilash")],
+        [KeyboardButton("🔑 Ota-ona PIN kodi"), KeyboardButton("📊 Tizim statistikasi")],
         [KeyboardButton("🔑 Admin kodi"), KeyboardButton("🔙 Asosiy menyu")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -529,12 +637,29 @@ def get_main_keyboard(chat_id: int):
     """Foydalanuvchi roliga mos menyu klaviaturasini qaytaradi."""
     teacher = db.get_teacher_by_chat_id(chat_id)
     is_admin_user = db.is_admin(chat_id)
+    parent = db.get_parent_by_chat_id(chat_id)
 
     if SITE_URL.startswith('https://'):
         top_btn = KeyboardButton("📓 Daftarni ochish (Sayt)", web_app=WebAppInfo(url=SITE_URL))
     else:
         top_btn = KeyboardButton("📓 Daftarni ochish (Sayt)")
 
+    # Agar ota-ona bo'lsa:
+    if parent and parent.get('children'):
+        keyboard = [
+            [top_btn],
+            [KeyboardButton("📊 Farzandim baholari"), KeyboardButton("⏰ Davomat nazorati")],
+            [KeyboardButton("📝 Uy vazifalari"), KeyboardButton("📅 Dars jadvali")],
+            [KeyboardButton("⚙️ Bildirishnoma sozlamalari"), KeyboardButton("🔑 Profil / Kirish")]
+        ]
+        if is_admin_user:
+            keyboard.append([KeyboardButton("👑 Admin paneli"), KeyboardButton("👨‍🏫 O'qituvchi boshqaruvi")])
+        elif teacher:
+            keyboard.append([KeyboardButton("👨‍🏫 O'qituvchi boshqaruvi")])
+        keyboard.append([KeyboardButton("ℹ️ Yordam / Buyruqlar")])
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+    # Standart o'quvchi / o'qituvchi menyusi
     keyboard = [
         [top_btn],
         [KeyboardButton("📊 Baholarim"), KeyboardButton("📅 Dars jadvali")],
@@ -546,7 +671,9 @@ def get_main_keyboard(chat_id: int):
         keyboard.append([KeyboardButton("👑 Admin paneli"), KeyboardButton("👨‍🏫 O'qituvchi boshqaruvi")])
     elif teacher:
         keyboard.append([KeyboardButton("👨‍🏫 O'qituvchi boshqaruvi")])
-    
+    else:
+        keyboard.append([KeyboardButton("👨‍👩‍👧 Ota-ona bo'lib ulanish")])
+
     keyboard.append([KeyboardButton("ℹ️ Yordam / Buyruqlar")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -557,20 +684,49 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     user_first_name = (update.effective_user.first_name if update.effective_user else None) or "Foydalanuvchi"
+    user_last_name = (update.effective_user.last_name if update.effective_user else "") or ""
+
+    # Deep linking orqali PIN kelgan bo'lsa (masalan: /start MD-1234)
+    if context.args and context.args[0].strip().upper().startswith('MD-'):
+        pin = context.args[0].strip().upper()
+        res = db.verify_and_link_parent(pin, chat_id, user_first_name, user_last_name)
+        if res['success']:
+            save_session_backup(chat_id, 'parent', pin)
+            await reply_safe(
+                update,
+                f"🎉 *TABRIKLAYMIZ!*\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Siz *{res['student_name']}*ning ota-onasi sifatida tizimga muvaffaqiyatli ulandingiz! 👨‍👩‍👧\n\n"
+                f"Endi farzandingizning:\n"
+                f"• Yangi olgan baholari ⭐\n"
+                f"• Darsga kelmaganligi yoki kechikishi ⏰\n"
+                f"• Kunlik o'zlashtirish hisoboti 📑\n"
+                f"to'g'ridan-to'g'ri shu botga avtomat yetkaziladi!\n\n"
+                f"Quyidagi menyudan foydalanishingiz mumkin 👇",
+                parse_mode='Markdown',
+                reply_markup=get_main_keyboard(chat_id)
+            )
+            return
+        else:
+            await reply_safe(update, f"❌ {res['error']}")
 
     is_admin_user = db.is_admin(chat_id)
     teacher = db.get_teacher_by_chat_id(chat_id)
     student = db.get_student_by_chat_id(chat_id)
+    parent = db.get_parent_by_chat_id(chat_id)
 
     status_text = ""
     if is_admin_user:
         status_text = f"\n👑 *Siz tizim bosh administratori sifatida tizimdasiz* (`admin`)"
     elif teacher:
         status_text = f"\n👨‍🏫 *Siz o'qituvchi sifatida tizimdasiz* (`{teacher['login']}`)"
+    elif parent and parent.get('children'):
+        c_names = ', '.join([c['name'] for c in parent['children']])
+        status_text = f"\n👨‍👩‍👧 *Siz ota-ona sifatida tizimdasiz* (Farzandingiz: *{c_names}*)"
     elif student:
         status_text = f"\n👨‍🎓 *Siz o'quvchi sifatida tizimdasiz*: *{student['name']}*"
     else:
-        status_text = "\n💡 *Eslatma:* Baholaringizni shaxsiy ko'rish uchun `/kirish login parol` yuboring."
+        status_text = "\n💡 *Eslatma:* O'quvchi hisobiga kirish uchun `/kirish login parol` yuboring yoki ota-ona bo'lib ulaning."
 
     reply_markup = get_main_keyboard(chat_id)
 
@@ -697,10 +853,127 @@ async def schedule_callback_handler(update: Update, context: ContextTypes.DEFAUL
         )
 
 
+async def show_parent_grades_view(update: Update, context: ContextTypes.DEFAULT_TYPE, parent: dict):
+    """Ota-onaga farzandlarining baholarini ko'rsatish."""
+    children = parent.get('children', [])
+    if not children:
+        await reply_safe(
+            update,
+            "👨‍👩‍👧 *Sizga hali birorta ham farzand biriktirilmagan.*\n\n"
+            "O'qituvchidan PIN-kod oling va `/otaona PIN` tarzida yuboring.",
+            parse_mode='Markdown'
+        )
+        return
+
+    for ch in children:
+        grades = db.get_grades(ch['id'])
+        if not grades:
+            await reply_safe(update, f"👤 *{ch['name']}*ga hali baholar qo'yilmagan.", parse_mode='Markdown')
+            continue
+
+        subjects = {}
+        for g in grades:
+            subj = g['subject']
+            if subj not in subjects:
+                subjects[subj] = []
+            subjects[subj].append(g)
+
+        text = f"📊 *{ch['name'].upper()}NING BAHOLARI (Ota-onalar nazorati)*\n"
+        text += "━━━━━━━━━━━━━━━━━━━━━━\n"
+
+        total_sum, total_cnt = 0, 0
+        for subj, sgrades in sorted(subjects.items()):
+            g_vals = [x['grade'] for x in sgrades]
+            avg = sum(g_vals) / len(g_vals)
+            g_str = ' '.join([_grade_emoji(x['grade']) for x in sgrades])
+            text += f"📘 *{subj}*: {g_str}\n"
+            text += f"   └── O'rtacha: *{avg:.2f}*\n\n"
+            total_sum += sum(g_vals)
+            total_cnt += len(g_vals)
+
+        overall = total_sum / total_cnt if total_cnt else 0
+        text += "━━━━━━━━━━━━━━━━━━━━━━\n"
+        text += f"📈 *Umumiy o'rtacha ball:* *{overall:.2f}* ⭐\n"
+        await reply_safe(update, text, parse_mode='Markdown')
+
+
+async def show_parent_attendance_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ota-onaga farzandining davomat hisobotini ko'rsatish."""
+    chat_id = update.effective_chat.id
+    parent = db.get_parent_by_chat_id(chat_id)
+    if not parent or not parent.get('children'):
+        await reply_safe(update, "👨‍👩‍👧 Siz ota-ona sifatida ulanmagansiz.", parse_mode='Markdown')
+        return
+
+    for ch in parent['children']:
+        records = db.get_student_attendance(ch['id'])
+        if not records:
+            await reply_safe(update, f"📋 *{ch['name']}* bo'yicha davomat qaydlari topilmadi (Darslarni qoldirmagan).", parse_mode='Markdown')
+            continue
+
+        text = f"⏰ *{ch['name'].upper()}NING DAVOMAT HISOBOTI*\n"
+        text += "━━━━━━━━━━━━━━━━━━━━━━\n"
+        for r in records[:15]:
+            icon = "✅ Keldi" if r['status'] == 'KELDI' else ("❌ Kelmadi" if r['status'] == 'KELMADI' else f"⏳ Kechikdi ({r['minutes_late']} daq.)")
+            note_str = f" - _{r['note']}_" if r.get('note') else ""
+            text += f"📅 `{r['lesson_date']}` | {r['slot_number']}-dars ({r['subject_name']})\n"
+            text += f"   └── Holat: *{icon}*{note_str}\n\n"
+
+        text += "━━━━━━━━━━━━━━━━━━━━━━"
+        await reply_safe(update, text, parse_mode='Markdown')
+
+
+async def show_parent_settings_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ota-onaning xabarnoma sozlamalarini ko'rsatish."""
+    chat_id = update.effective_chat.id
+    parent = db.get_parent_by_chat_id(chat_id)
+    if not parent:
+        await reply_safe(update, "👨‍👩‍👧 Siz ota-ona sifatida ulanmagansiz.", parse_mode='Markdown')
+        return
+    settings = db.get_parent_settings(parent['id'])
+    markup = get_parent_settings_markup(settings)
+    await reply_safe(
+        update,
+        "⚙️ *BILDIRISHNOMA VA XABARLAR SOZLAMALARI*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Qaysi xabarlarni Telegram orqali olishni xohlaysiz? Kerakli tugmani bosib yoqing yoki o'chiring:\n\n"
+        "• 🔔 *Baholar* — Yangi baho qo'yilganda darhol xabar\n"
+        "• 🚨 *Davomat* — Darsga kelmasa yoki kechiksa ogohlantirish\n"
+        "• 📑 *Kunlik hisobot* — Har kuni soat 18:00 da umumiy xulosa\n"
+        "• 📝 *Vazifalar* — Yangi uy vazifalari haqida xabar",
+        parse_mode='Markdown',
+        reply_markup=markup
+    )
+
+
+async def parent_settings_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ota-ona bildirishnoma sozlamalari tugmalarini almashtirish (toggle)."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = query.message.chat_id
+    parent = db.get_parent_by_chat_id(chat_id)
+    if not parent:
+        return
+
+    key = data.replace('toggle_', '')
+    updated = db.toggle_parent_setting(parent['id'], key)
+    if updated:
+        markup = get_parent_settings_markup(updated)
+        try:
+            await query.edit_message_reply_markup(reply_markup=markup)
+        except Exception:
+            pass
+
+
 async def show_grades_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Baholarni ko'rsatish."""
+    """Baholarni ko'rsatish (O'quvchi yoki Ota-ona uchun)."""
     chat_id = update.effective_chat.id
     student = db.get_student_by_chat_id(chat_id)
+    parent = db.get_parent_by_chat_id(chat_id)
+
+    if not student and parent and parent.get('children'):
+        return await show_parent_grades_view(update, context, parent)
 
     if not student:
         await reply_safe(
@@ -708,7 +981,7 @@ async def show_grades_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔒 *Siz hali tizimga kirmagansiz!*\n\n"
             "O'z baholaringizni ko'rish uchun o'quvchi hisobingizga kiring:\n"
             "`/kirish login parol`\n\n"
-            "Masalan: `/kirish ali ali123`",
+            "Yoki ota-ona bo'lib ulanish uchun: `MD-XXXX` PIN-kodini yuboring.",
             parse_mode='Markdown'
         )
         return
@@ -1025,11 +1298,11 @@ async def cmd_oquvchilar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_baho(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     teacher = db.get_teacher_by_chat_id(chat_id)
-    if not teacher:
-        await reply_safe(update, "❌ Bu buyruq faqat o'qituvchilar uchun.")
+    if not (teacher or db.is_admin(chat_id)):
+        await reply_safe(update, "❌ Bu buyruq faqat o'qituvchilar va adminlar uchun.")
         return
     if len(context.args) < 3:
-        await reply_safe(update, "❌ Foydalanish: `/baho login fan baho(2-5)`\nMasalan: `/baho ali Matematika 5`", parse_mode='Markdown')
+        await reply_safe(update, "❌ Foydalanish: `/baho login fan baho(2-5) [izoh]`\nMasalan: `/baho ali Matematika 5 Doskada a'lo javob berdi`", parse_mode='Markdown')
         return
     login, subject = context.args[0], context.args[1]
     try:
@@ -1043,16 +1316,181 @@ async def cmd_baho(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not student:
         await reply_safe(update, f"❌ '{login}' loginli o'quvchi topilmadi.")
         return
-    db.add_grade(student['id'], subject, grade)
+
+    comment = ' '.join(context.args[3:]).strip() if len(context.args) > 3 else ""
+    teacher_name = teacher.get('login', "O'qituvchi") if teacher else "O'qituvchi"
+
+    db.add_grade(student['id'], subject, grade, comment=comment, teacher_name=teacher_name)
+
+    # Ota-onalarga avtomatik bildirishnoma tarqatish
+    await notify_parents_grade(context.bot, db, student['id'], subject, grade, teacher_name, comment)
+
     emoji = _grade_emoji(grade)
+    comment_text = f"\n💬 Izoh: _{comment}_" if comment else ""
     await reply_safe(
         update,
         f"✅ *Baho qo'yildi!*\n\n"
         f"👤 O'quvchi: *{student['name']}*\n"
         f"📘 Fan: *{subject}*\n"
-        f"⭐ Baho: {emoji}",
+        f"⭐ Baho: {emoji}{comment_text}\n\n"
+        f"💡 _O'quvchining ota-onalariga avtomatik bildirishnoma yetkazildi._",
         parse_mode='Markdown'
     )
+
+
+async def cmd_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """O'quvchi uchun ota-ona PIN-kodini olish yoki yaratish."""
+    chat_id = update.effective_chat.id
+    if not (db.get_teacher_by_chat_id(chat_id) or db.is_admin(chat_id)):
+        await reply_safe(update, "❌ Bu buyruq faqat o'qituvchilar va adminlar uchun.")
+        return
+    if not context.args:
+        await reply_safe(update, "❌ Foydalanish: `/pin login`\nMasalan: `/pin ali123`", parse_mode='Markdown')
+        return
+    login = context.args[0].strip()
+    student = db.get_student_by_login(login)
+    if not student:
+        await reply_safe(update, f"❌ '{login}' loginli o'quvchi topilmadi.")
+        return
+    pin = db.generate_student_pin(student['id'])
+    bot_info = await context.bot.get_me()
+    deep_link = f"https://t.me/{bot_info.username}?start={pin}"
+    await reply_safe(
+        update,
+        f"🔑 *OTA-ONA ULANISH KODI (PIN)*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 O'quvchi: *{student['name']}* (`{student['login']}`)\n"
+        f"🔢 Taklif kodi: `{pin}`\n"
+        f"⏳ Amal qilish muddati: 7 kun\n\n"
+        f"📲 *Ota-onaga yuborish uchun havola:*\n"
+        f"{deep_link}\n\n"
+        f"Ota-ona botga kirib `{pin}` kodini yuborishi yoki yuqoridagi havolani bosishi kifoya!",
+        parse_mode='Markdown'
+    )
+
+
+async def cmd_davomat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Davomat kiritish va ota-onaga darhol ogohlantirish yuborish."""
+    chat_id = update.effective_chat.id
+    if not (db.get_teacher_by_chat_id(chat_id) or db.is_admin(chat_id)):
+        await reply_safe(update, "❌ Bu buyruq faqat o'qituvchilar va adminlar uchun.")
+        return
+    if len(context.args) < 3:
+        await reply_safe(
+            update,
+            "❌ *Foydalanish:* `/davomat login dars_raqami holat [kechikish_daqiqa] [izoh]`\n\n"
+            "📌 *Holatlar:* `keldi`, `kelmadi`, `kechikdi`, `sababli`\n\n"
+            "Misollar:\n"
+            "• `/davomat ali 1 kelmadi`\n"
+            "• `/davomat ali 2 kechikdi 15 Uxlab qolibdi`\n"
+            "• `/davomat ali 3 sababli Shamollagan`",
+            parse_mode='Markdown'
+        )
+        return
+    login = context.args[0].strip()
+    student = db.get_student_by_login(login)
+    if not student:
+        await reply_safe(update, f"❌ '{login}' loginli o'quvchi topilmadi.")
+        return
+
+    try:
+        slot = int(context.args[1])
+        status = context.args[2].upper()
+        if status not in ['KELDI', 'KELMADI', 'KECHIKDI', 'SABABLI']:
+            await reply_safe(update, "❌ Noto'g'ri holat. Faqat: `keldi`, `kelmadi`, `kechikdi`, `sababli`", parse_mode='Markdown')
+            return
+        minutes_late = int(context.args[3]) if len(context.args) > 3 and context.args[3].isdigit() else 0
+        note_idx = 4 if len(context.args) > 3 and context.args[3].isdigit() else 3
+        note = ' '.join(context.args[note_idx:]).strip() if len(context.args) > note_idx else ""
+    except Exception:
+        await reply_safe(update, "❌ Dars raqami raqam bo'lishi kerak (1-7).")
+        return
+
+    weekday = datetime.now().isoweekday()
+    sched = [s for s in db.get_schedule() if s['day'] == weekday and s['slot'] == slot]
+    subject_name = sched[0]['subject'] if sched and sched[0]['subject'] else f"{slot}-dars"
+
+    db.add_attendance(student['id'], slot, subject_name, status, minutes_late, note)
+    await notify_parents_attendance(context.bot, db, student['id'], slot, subject_name, status, minutes_late, note)
+
+    late_text = f" ({minutes_late} daqiqa)" if minutes_late else ""
+    note_text = f"\n💬 Izoh: _{note}_" if note else ""
+    await reply_safe(
+        update,
+        f"✅ *Davomat belgilandi!*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 O'quvchi: *{student['name']}*\n"
+        f"🔔 Dars: *{slot}-dars ({subject_name})*\n"
+        f"📌 Holat: *{status}*{late_text}{note_text}\n\n"
+        f"💡 _Agar o'quvchi kelmagan yoki kechikkan bo'lsa, ota-onasiga darhol ogohlantirish yuborildi._",
+        parse_mode='Markdown'
+    )
+
+
+async def cmd_ogohlantirish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """O'qituvchidan ota-onaga shaxsiy ogohlantirish yoki e'lon yuborish."""
+    chat_id = update.effective_chat.id
+    teacher = db.get_teacher_by_chat_id(chat_id)
+    if not (teacher or db.is_admin(chat_id)):
+        await reply_safe(update, "❌ Bu buyruq faqat o'qituvchilar va adminlar uchun.")
+        return
+    if len(context.args) < 2:
+        await reply_safe(
+            update,
+            "❌ *Foydalanish:* `/ogohlantirish login Xabar matni`\n\n"
+            "Masalan:\n`/ogohlantirish ali Ertaga ota-onalar majlisi soat 17:00 da bo'ladi.`",
+            parse_mode='Markdown'
+        )
+        return
+    login = context.args[0].strip()
+    student = db.get_student_by_login(login)
+    if not student:
+        await reply_safe(update, f"❌ '{login}' loginli o'quvchi topilmadi.")
+        return
+    message = ' '.join(context.args[1:]).strip()
+    teacher_name = teacher.get('login', "O'qituvchi") if teacher else "Maktab ma'muriyati"
+    db.add_parent_notice(student['id'], teacher['id'] if teacher else None, message, is_urgent=True)
+    sent = await notify_parents_notice(context.bot, db, student['id'], teacher_name, "", message, is_urgent=True)
+    if sent:
+        await reply_safe(update, f"✅ *Xabar {student['name']}ning ota-onasiga yetkazildi!*", parse_mode='Markdown')
+    else:
+        pin = db.get_student_pin(student['id'])
+        await reply_safe(update, f"⚠️ Xabar saqlandi, lekin {student['name']}ga hali ota-ona ulanmagan.\nOta-onani ulash uchun PIN: `{pin}`", parse_mode='Markdown')
+
+
+async def cmd_otaona(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ota-onani PIN orqali ulash buyrug'i."""
+    chat_id = update.effective_chat.id
+    user_fn = (update.effective_user.first_name if update.effective_user else "Ota-ona")
+    user_ln = (update.effective_user.last_name if update.effective_user else "") or ""
+    if not context.args:
+        parent_link_states[chat_id] = True
+        await reply_safe(
+            update,
+            "👨‍👩‍👧 *OTA-ONA BO'LIB ULANISH*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Farzandingizning o'qituvchisi bergan taklif PIN-kodini yuboring:\n"
+            "Masalan: `MD-4829`\n\n"
+            "_Bekor qilish uchun:_ /cancel",
+            parse_mode='Markdown'
+        )
+        return
+
+    pin = context.args[0].strip().upper()
+    res = db.verify_and_link_parent(pin, chat_id, user_fn, user_ln)
+    if res['success']:
+        save_session_backup(chat_id, 'parent', pin)
+        await reply_safe(
+            update,
+            f"🎉 *TABRIKLAYMIZ!*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Siz *{res['student_name']}*ning ota-onasi sifatida tizimga muvaffaqiyatli ulandingiz! 👨‍👩‍👧\n\n"
+            f"Endi har bir yangi baho, davomat va vazifalar ushbu botga avtomat kelib turadi.",
+            parse_mode='Markdown',
+            reply_markup=get_main_keyboard(chat_id)
+        )
+    else:
+        await reply_safe(update, f"❌ {res['error']}")
 
 
 async def cmd_rasmlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1109,9 +1547,55 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
     elif text in ["📊 Baholarim", "Baholar", "baholar"]:
         await show_grades_view(update, context)
+    elif text in ["📊 Farzandim baholari", "Farzandim baholari"]:
+        parent = db.get_parent_by_chat_id(chat_id)
+        if parent and parent.get('children'):
+            await show_parent_grades_view(update, context, parent)
+        else:
+            await show_grades_view(update, context)
+        return
+    elif text in ["⏰ Davomat nazorati", "Davomat", "davomat"]:
+        await show_parent_attendance_view(update, context)
+        return
+    elif text in ["⚙️ Bildirishnoma sozlamalari", "Sozlamalar", "sozlamalar"]:
+        await show_parent_settings_view(update, context)
+        return
+    elif text in ["👨‍👩‍👧 Ota-ona bo'lib ulanish"]:
+        parent_link_states[chat_id] = True
+        await reply_safe(
+            update,
+            "👨‍👩‍👧 *OTA-ONA BO'LIB ULANISH*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Farzandingizning o'qituvchisi bergan taklif PIN-kodini yuboring:\n"
+            "Masalan: `MD-4829`\n\n"
+            "_Bekor qilish uchun:_ /cancel",
+            parse_mode='Markdown'
+        )
+        return
+    elif text in ["🔑 Ota-ona PIN kodi"]:
+        await reply_safe(
+            update,
+            "🔑 *O'QUVCHI UCHUN OTA-ONA PIN KODINI OLISH*\n"
+            "Quyidagi buyruqni yuboring:\n"
+            "`/pin login`\n\n"
+            "Masalan: `/pin ali123`",
+            parse_mode='Markdown'
+        )
+        return
+    elif text in ["⏰ Davomat belgilash"]:
+        await reply_safe(
+            update,
+            "⏰ *DAVOMAT BELGILASH BUYRUG'I*\n"
+            "`/davomat login dars_raqami holat [kechikish_daq] [izoh]`\n\n"
+            "Masalan:\n"
+            "• `/davomat ali 1 kelmadi`\n"
+            "• `/davomat ali 2 kechikdi 15`",
+            parse_mode='Markdown'
+        )
+        return
     elif text in ["📅 Dars jadvali", "Dars jadvali", "jadval"]:
         await send_schedule_view(update.effective_chat.id, context)
-    elif text in ["📝 Uy vazifalari", "Uy vazifalari", "vazifalar"]:
+    elif text in ["📝 Uy vazifalari", "Uy vazifalari", "vazifalar", "Uyga vazifalar"]:
         await show_tasks_view(update, context)
     elif text in ["🏆 Imtihonlar", "Imtihon", "imtihon"]:
         await show_exam_view(update, context)
@@ -1131,8 +1615,32 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.effective_chat.id
     if text == "/cancel":
         admin_states.pop(chat_id, None)
+        parent_link_states.pop(chat_id, None)
         await reply_safe(update, "❌ Amal bekor qilindi.", reply_markup=get_main_keyboard(chat_id))
         return
+
+    # Ota-ona PIN-kodini kiritishi tekshiruvi
+    if text.upper().startswith('MD-') or (chat_id in parent_link_states and not text.startswith('/')):
+        pin = text.strip().upper()
+        user_fn = (update.effective_user.first_name if update.effective_user else "Ota-ona")
+        user_ln = (update.effective_user.last_name if update.effective_user else "") or ""
+        res = db.verify_and_link_parent(pin, chat_id, user_fn, user_ln)
+        parent_link_states.pop(chat_id, None)
+        if res['success']:
+            save_session_backup(chat_id, 'parent', pin)
+            await reply_safe(
+                update,
+                f"🎉 *TABRIKLAYMIZ!*\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Siz *{res['student_name']}*ning ota-onasi sifatida tizimga muvaffaqiyatli ulandingiz! 👨‍👩‍👧\n\n"
+                f"Endi har bir yangi baho, davomat va vazifalar ushbu botga avtomat kelib turadi.",
+                parse_mode='Markdown',
+                reply_markup=get_main_keyboard(chat_id)
+            )
+            return
+        else:
+            await reply_safe(update, f"❌ {res['error']}\nQaytadan urinib ko'ring yoki /cancel yozing.")
+            return
 
     if chat_id in admin_states and db.is_admin(chat_id):
         current_state = admin_states[chat_id]
@@ -1405,6 +1913,9 @@ async def send_daily_grades(bot):
 # ══════════════════════════════════════════════════════════════
 
 async def main():
+    global bot_loop, tg_application
+    bot_loop = asyncio.get_running_loop()
+
     if not TOKEN:
         logger.error("BOT_TOKEN muhit o'zgaruvchisi topilmadi! .env faylni tekshiring.")
         return
@@ -1437,6 +1948,7 @@ async def main():
         .request(request_config)
         .build()
     )
+    tg_application = application
 
     # Global xatoliklar ushlovchisi (bot to'xtab qolmasligi uchun)
     application.add_error_handler(global_error_handler)
@@ -1450,11 +1962,18 @@ async def main():
     application.add_handler(CommandHandler("oquvchi_qosh", cmd_oquvchi_qosh))
     application.add_handler(CommandHandler("oquvchilar", cmd_oquvchilar))
     application.add_handler(CommandHandler("baho", cmd_baho))
+    application.add_handler(CommandHandler("pin", cmd_pin))
+    application.add_handler(CommandHandler("otaona_kod", cmd_pin))
+    application.add_handler(CommandHandler("davomat", cmd_davomat))
+    application.add_handler(CommandHandler("ogohlantirish", cmd_ogohlantirish))
+    application.add_handler(CommandHandler("otaona", cmd_otaona))
     application.add_handler(CommandHandler("rasmlar", cmd_rasmlar))
     application.add_handler(CommandHandler("chiqish", cmd_chiqish))
 
     # Jadval callbacklari
     application.add_handler(CallbackQueryHandler(schedule_callback_handler, pattern="^sched_"))
+    # Ota-ona bildirishnoma sozlamalari callbacklari
+    application.add_handler(CallbackQueryHandler(parent_settings_callback_handler, pattern="^toggle_notify_"))
 
     # Rasm yuborish
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
@@ -1475,6 +1994,10 @@ async def main():
         commands = [
             BotCommand("start", "📓 Boshlash va menyuni ochish"),
             BotCommand("baholarim", "📊 Baholarim va o'rtacha ball"),
+            BotCommand("otaona", "👪 Ota-ona kabineti"),
+            BotCommand("pin", "🔑 Ota-onani ulash PIN-kodi"),
+            BotCommand("davomat", "📋 Davomat kiritish (kelmadi/kechikdi)"),
+            BotCommand("ogohlantirish", "⚠️ Ota-onalarga ogohlantirish"),
             BotCommand("kirish", "👨‍🎓 O'quvchi hisobiga kirish"),
             BotCommand("help", "ℹ️ Yordam va ma'lumot"),
             BotCommand("oqituvchi", "👨‍🏫 O'qituvchi hisobiga kirish"),
@@ -1497,9 +2020,10 @@ async def main():
 
     logger.info("✅ Telegram bot ishga tushdi!")
 
-    # ── APScheduler (14:00 Toshkent vaqti) ──
+    # ── APScheduler ──
     tz = pytz.timezone('Asia/Tashkent')
     scheduler = AsyncIOScheduler(timezone=tz)
+    # 14:00 O'quvchilarga kundalik baholar
     scheduler.add_job(
         send_daily_grades,
         CronTrigger(hour=14, minute=0, timezone=tz),
@@ -1507,8 +2031,16 @@ async def main():
         id='daily_grades',
         replace_existing=True
     )
+    # 18:00 Ota-onalarga kundalik xulosa (baholar, davomat, vazifalar)
+    scheduler.add_job(
+        send_daily_digests_job,
+        CronTrigger(hour=18, minute=0, timezone=tz),
+        args=[application.bot],
+        id='daily_parent_digest',
+        replace_existing=True
+    )
     scheduler.start()
-    logger.info("✅ Kundalik bildirishnoma (14:00 Toshkent) sozlandi.")
+    logger.info("✅ Kundalik bildirishnomalar (14:00 o'quvchilar, 18:00 ota-onalar - Toshkent) sozlandi.")
 
     print("\n" + "=" * 55)
     print("[OK] RAQAMLI DAFTAR TIZIMI MUVAFFAQIYATLI ISHGA TUSHDI!")
