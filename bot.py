@@ -2043,7 +2043,7 @@ async def main():
     scheduler.add_job(
         send_daily_digests_job,
         CronTrigger(hour=18, minute=0, timezone=tz),
-        args=[application.bot],
+        args=[application.bot, db],
         id='daily_parent_digest',
         replace_existing=True
     )
