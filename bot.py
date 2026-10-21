@@ -45,8 +45,14 @@ from notifications import (
 
 load_dotenv()
 
+_OLD_REVOKED_TOKEN = '8783586377:AAF8Bx_hp0cCLImSoMKu2HgjffYYGBiLIg4'
 _DEFAULT_BOT_TOKEN = base64.b64decode('ODc4MzU4NjM3NzpBQUZhVnNWTExCVzdlYWloSEYwbFF0eHFwd29ZWDFiZ1RQQQ==').decode()
-TOKEN = (os.getenv('BOT_TOKEN') or _DEFAULT_BOT_TOKEN).strip()
+_env_tok = (os.getenv('BOT_TOKEN') or '').strip()
+if not _env_tok or _env_tok == _OLD_REVOKED_TOKEN:
+    TOKEN = _DEFAULT_BOT_TOKEN
+else:
+    TOKEN = _env_tok
+
 PORT = int(os.getenv('PORT', '5000'))
 
 # Sayt manzili: Render yoki tashqi muhitdan avtomatik aniqlash
