@@ -1795,6 +1795,7 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Matnli tugmalar bosilganda ishlaydigan markaziy handler."""
     if not update.message or not update.message.text:
         return
+    chat_id = update.effective_chat.id
     text = update.message.text.strip()
 
     if text in ["📓 Daftarni ochish (Sayt)", "Daftarni ochish", "Sayt", "sayt", "Daftar"]:
@@ -1828,6 +1829,19 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     elif text in ["🏫 Sinflar (1-11)", "🏫 Sinflar", "Sinflar", "sinflar"]:
         await cmd_sinflar(update, context)
+        return
+    elif text in ["📋 O'quvchilar ro'yxati", "O'quvchilar ro'yxati"]:
+        await cmd_oquvchilar(update, context)
+        return
+    elif text in ["⭐ Baho qo'yish", "Baho qo'yish"]:
+        await reply_safe(
+            update,
+            "⭐ <b>BAHO QO'YISH BUYRUG'I:</b>\n\n"
+            "Format: <code>/baho [login] [fan] [baho(2-5)] [izoh(ixtiyoriy)]</code>\n\n"
+            "Misol:\n"
+            "<code>/baho ali Matematika 5 Doskada a'lo javob berdi</code>",
+            parse_mode="HTML"
+        )
         return
     elif text in ["📊 Farzandim baholari", "Farzandim baholari"]:
         parent = db.get_parent_by_chat_id(chat_id)
