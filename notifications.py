@@ -109,8 +109,12 @@ def format_attendance_alert(student_name: str, subject: str, slot: int, status: 
     return html
 
 
-def format_daily_digest(student_name: str, date_str: str, grades_list: list, tasks_list: list, attendance_records: list) -> str:
+def format_daily_digest(student_name: str, date_str: str, grades_list: list = None, tasks_list: list = None, attendance_records: list = None, **kwargs) -> str:
     """Kun yakunidagi oylik/haftalik/kunlik hisobot shabloni."""
+    grades = grades_list if grades_list is not None else kwargs.get('grades', [])
+    tasks = tasks_list if tasks_list is not None else kwargs.get('tasks', [])
+    attendance = attendance_records if attendance_records is not None else kwargs.get('attendance', [])
+
     html = (
         f"📑 <b>KUNLIK YAKUNIY HISOBOT — {date_str}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -119,8 +123,8 @@ def format_daily_digest(student_name: str, date_str: str, grades_list: list, tas
 
     # 1. Davomat qismi
     html += "📋 <b>Bugungi davomat:</b>\n"
-    if attendance_records:
-        for a in attendance_records:
+    if attendance:
+        for a in attendance:
             icon = "✅" if a['status'] == 'KELDI' else ("❌" if a['status'] == 'KELMADI' else "⏰")
             late_str = f" ({a['minutes_late']} daq.)" if a.get('minutes_late') and a['status'] == 'KECHIKDI' else ""
             html += f" • {a['slot_number']}-dars ({a['subject_name']}): {icon} <b>{a['status']}</b>{late_str}\n"
@@ -129,8 +133,8 @@ def format_daily_digest(student_name: str, date_str: str, grades_list: list, tas
 
     # 2. Baholar qismi
     html += "\n⭐ <b>Bugun olingan baholar:</b>\n"
-    if grades_list:
-        for g in grades_list:
+    if grades:
+        for g in grades:
             comment_str = f" <i>(«{g['comment']}»)</i>" if g.get('comment') else ""
             html += f" • {g['subject']}: <b>{g['grade']}</b>{comment_str}\n"
     else:
@@ -138,8 +142,8 @@ def format_daily_digest(student_name: str, date_str: str, grades_list: list, tas
 
     # 3. Uy vazifalari qismi
     html += "\n📝 <b>Ertangi/Yaqin kunlarga vazifalar:</b>\n"
-    if tasks_list:
-        for idx, t in enumerate(tasks_list[:5], 1):
+    if tasks:
+        for idx, t in enumerate(tasks[:5], 1):
             html += f" <b>{idx}.</b> {t['text']} <i>(Muddat: {t['deadline']})</i>\n"
     else:
         html += " • <i>Faol uy vazifalari yo'q.</i>\n"
