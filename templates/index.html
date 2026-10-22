@@ -1526,14 +1526,14 @@
             if (state.user.role === 'teacher') {
                 roleBadge.textContent = `👨‍🏫 ${state.user.login}`;
                 roleBadge.style.backgroundColor = 'var(--primary-light)';
-                if (!['jadval', 'vazifalar', 'oquvchilar', 'baholar'].includes(state.activeTab)) {
+                if (!['jadval', 'vazifalar', 'oquvchilar', 'baholar', 'reyting'].includes(state.activeTab)) {
                     state.activeTab = 'jadval';
                 }
                 renderTeacherDashboard();
             } else {
                 roleBadge.textContent = `👨‍🎓 ${state.user.name || state.user.login}`;
                 roleBadge.style.backgroundColor = 'var(--accent-green-light)';
-                if (!['bosh_sahifa', 'vazifalar', 'baholarim'].includes(state.activeTab)) {
+                if (!['bosh_sahifa', 'vazifalar', 'baholarim', 'reyting'].includes(state.activeTab)) {
                     state.activeTab = 'bosh_sahifa';
                 }
                 renderStudentDashboard();
@@ -1572,6 +1572,9 @@
                     <button class="nav-tab-btn ${state.activeTab === 'baholar' ? 'active' : ''}" onclick="switchTab('baholar')">
                         <span>⭐</span> <span>Baholar</span>
                     </button>
+                    <button class="nav-tab-btn ${state.activeTab === 'reyting' ? 'active' : ''}" onclick="switchTab('reyting')">
+                        <span>🏆</span> <span>Reyting</span>
+                    </button>
                 </div>
             `;
 
@@ -1595,6 +1598,10 @@
                     <span class="emoji">⭐</span>
                     <span>Baholar</span>
                 </button>
+                <button class="mobile-nav-item ${state.activeTab === 'reyting' ? 'active' : ''}" onclick="switchTab('reyting')">
+                    <span class="emoji">🏆</span>
+                    <span>Reyting</span>
+                </button>
             `;
 
             container.innerHTML = desktopNavHtml + `<div id="tabContentArea" class="mt-2"></div>`;
@@ -1609,6 +1616,8 @@
                 renderTeacherStudentsTab(contentArea);
             } else if (state.activeTab === 'baholar') {
                 renderTeacherGradesTab(contentArea);
+            } else if (state.activeTab === 'reyting') {
+                renderLeaderboardTab(contentArea);
             }
         }
 
@@ -1903,21 +1912,29 @@
                 const res = await api('/api/students');
                 state.students = res.students || [];
 
+                const classOptions = Array.from({length: 11}, (_, i) => `${i+1}-sinf`);
+
                 let html = `
                     <!-- Add Student Card -->
                     <div class="notebook-card mb-3">
-                        <h2 style="font-size: 1.8rem; margin-bottom: 8px;">➕ Yangi o'quvchi qo'shish</h2>
-                        <form id="addStudentForm" onsubmit="handleAddStudentSubmit(event)" style="display: grid; grid-template-columns: 1.5fr 1fr 1fr auto; gap: 14px; align-items: end;">
+                        <h2 style="font-size: 1.8rem; margin-bottom: 8px;">➕ Yangi o'quvchi qo'shish (1-11 sinflar)</h2>
+                        <form id="addStudentForm" onsubmit="handleAddStudentSubmit(event)" style="display: grid; grid-template-columns: 1.2fr 0.9fr 1fr 1fr auto; gap: 14px; align-items: end;">
                             <div class="form-group" style="margin: 0;">
                                 <label class="form-label">O'quvchi F.I.Sh:</label>
                                 <input type="text" id="newStudentName" class="form-input" required placeholder="Masalan: Alisher Navoiy">
+                            </div>
+                            <div class="form-group" style="margin: 0;">
+                                <label class="form-label">🏫 Sinf (1-11):</label>
+                                <select id="newStudentClass" class="form-input" required style="font-weight: 700;">
+                                    ${classOptions.map(c => `<option value="${c}" ${c === '5-sinf' ? 'selected' : ''}>${c}</option>`).join('')}
+                                </select>
                             </div>
                             <div class="form-group" style="margin: 0;">
                                 <label class="form-label">Login:</label>
                                 <input type="text" id="newStudentLogin" class="form-input" required placeholder="Masalan: alisher_n">
                             </div>
                             <div class="form-group" style="margin: 0;">
-                                <label class="form-label">Boshlang'ich parol (min 4):</label>
+                                <label class="form-label">Parol (min 4):</label>
                                 <input type="text" id="newStudentPass" class="form-input" required minlength="4" placeholder="••••••••">
                             </div>
                             <button type="submit" id="addStudentBtn" class="btn btn-primary" style="height: 48px;">
@@ -1932,10 +1949,16 @@
                             <div>
                                 <h2 style="font-size: 1.8rem; margin: 0;">👥 O'quvchilar ro'yxati (${state.students.length})</h2>
                                 <p style="color: var(--text-muted); font-size: 0.9rem;">
-                                    Sinf o'quvchilarining login ma'lumotlari va parollarini boshqaring.
+                                    Sinf o'quvchilarining login ma'lumotlari, sinflari va parollarini boshqaring.
                                 </p>
                             </div>
-                            <input type="text" id="studentSearchInput" class="form-input" style="max-width: 250px; padding: 8px 12px;" placeholder="🔍 Ism yoki login orqali izlash..." oninput="filterStudentsTable(this.value)">
+                            <div class="d-flex align-center" style="gap: 10px; flex-wrap: wrap;">
+                                <select id="studentClassFilter" class="form-input" style="max-width: 160px; padding: 8px 12px; font-weight: 700;" onchange="filterStudentsTable(document.getElementById('studentSearchInput').value)">
+                                    <option value="">Barcha sinflar</option>
+                                    ${classOptions.map(c => `<option value="${c}">${c}</option>`).join('')}
+                                </select>
+                                <input type="text" id="studentSearchInput" class="form-input" style="max-width: 220px; padding: 8px 12px;" placeholder="🔍 Izlash..." oninput="filterStudentsTable(this.value)">
+                            </div>
                         </div>
 
                         <div class="table-responsive">
@@ -1944,6 +1967,7 @@
                                     <tr>
                                         <th style="width: 50px;">№</th>
                                         <th>Ism-familiya</th>
+                                        <th>Sinf</th>
                                         <th>Login</th>
                                         <th>Telegram</th>
                                         <th style="text-align: right;">Amallar</th>
@@ -1951,11 +1975,16 @@
                                 </thead>
                                 <tbody>
                                     ${state.students.length === 0 ? `
-                                        <tr><td colspan="5" class="empty-state">Hozircha o'quvchilar yo'q. Yuqoridagi shakldan qo'shing.</td></tr>
+                                        <tr><td colspan="6" class="empty-state">Hozircha o'quvchilar yo'q. Yuqoridagi shakldan qo'shing.</td></tr>
                                     ` : state.students.map((s, idx) => `
-                                        <tr class="student-row" data-name="${escapeHtml(s.name.toLowerCase())}" data-login="${escapeHtml(s.login.toLowerCase())}">
+                                        <tr class="student-row" data-name="${escapeHtml(s.name.toLowerCase())}" data-login="${escapeHtml(s.login.toLowerCase())}" data-class="${escapeHtml((s.class_name || '5-sinf').toLowerCase())}">
                                             <td style="font-weight: 800; color: var(--text-muted);">${idx + 1}</td>
                                             <td style="font-weight: 800; font-size: 1rem;">${escapeHtml(s.name)}</td>
+                                            <td>
+                                                <span class="subject-tag" style="background:var(--primary-light); color:var(--primary); font-weight: 800;">
+                                                    🏫 ${escapeHtml(s.class_name || '5-sinf')}
+                                                </span>
+                                            </td>
                                             <td><code style="font-weight: 700; background: var(--input-bg); padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border-color);">${escapeHtml(s.login)}</code></td>
                                             <td>
                                                 ${s.telegram_chat_id ?
@@ -1986,12 +2015,18 @@
         }
 
         window.filterStudentsTable = function(query) {
-            const q = query.toLowerCase().trim();
+            const q = (query || '').toLowerCase().trim();
+            const classFilter = (document.getElementById('studentClassFilter')?.value || '').toLowerCase().trim();
             const rows = document.querySelectorAll('.student-row');
             rows.forEach(r => {
                 const name = r.dataset.name || '';
                 const login = r.dataset.login || '';
-                if (name.includes(q) || login.includes(q)) {
+                const sClass = r.dataset.class || '';
+
+                const matchesQuery = !q || name.includes(q) || login.includes(q);
+                const matchesClass = !classFilter || sClass === classFilter || sClass.startsWith(classFilter);
+
+                if (matchesQuery && matchesClass) {
                     r.style.display = '';
                 } else {
                     r.style.display = 'none';
@@ -2004,6 +2039,7 @@
             const name = document.getElementById('newStudentName').value.trim();
             const login = document.getElementById('newStudentLogin').value.trim();
             const password = document.getElementById('newStudentPass').value.trim();
+            const className = document.getElementById('newStudentClass').value;
             const btn = document.getElementById('addStudentBtn');
 
             btn.disabled = true;
@@ -2012,9 +2048,9 @@
             try {
                 await api('/api/students', {
                     method: 'POST',
-                    body: JSON.stringify({ name, login, password })
+                    body: JSON.stringify({ name, login, password, class_name: className })
                 });
-                showToast(`${name} muvaffaqiyatli qo'shildi!`, "success");
+                showToast(`${name} (${className}) muvaffaqiyatli qo'shildi!`, "success");
                 renderTeacherStudentsTab(document.getElementById('tabContentArea'));
             } catch (err) {
                 showToast(err.message, "error");
@@ -2352,6 +2388,9 @@
                     <button class="nav-tab-btn ${state.activeTab === 'baholarim' ? 'active' : ''}" onclick="switchTab('baholarim')">
                         <span>📊</span> <span>Baholarim</span>
                     </button>
+                    <button class="nav-tab-btn ${state.activeTab === 'reyting' ? 'active' : ''}" onclick="switchTab('reyting')">
+                        <span>🏆</span> <span>Reyting</span>
+                    </button>
                 </div>
             `;
 
@@ -2371,6 +2410,10 @@
                     <span class="emoji">📊</span>
                     <span>Baholarim</span>
                 </button>
+                <button class="mobile-nav-item ${state.activeTab === 'reyting' ? 'active' : ''}" onclick="switchTab('reyting')">
+                    <span class="emoji">🏆</span>
+                    <span>Reyting</span>
+                </button>
             `;
 
             container.innerHTML = desktopNavHtml + `<div id="tabContentArea" class="mt-2"></div>`;
@@ -2383,6 +2426,8 @@
                 renderStudentTasksTab(contentArea);
             } else if (state.activeTab === 'baholarim') {
                 renderStudentGradesTab(contentArea);
+            } else if (state.activeTab === 'reyting') {
+                renderLeaderboardTab(contentArea);
             }
         }
 
@@ -2885,6 +2930,121 @@
                 </div>
             `;
         };
+
+        // ══════════════════════════════════════════════════════════════
+        //               4. LEADERBOARD (REYTING) TAB
+        // ══════════════════════════════════════════════════════════════
+
+        async function renderLeaderboardTab(container, selectedClass = '') {
+            container.innerHTML = `<div class="empty-state"><span class="spinner spinner-dark"></span> Reyting yuklanmoqda...</div>`;
+
+            try {
+                const url = selectedClass ? `/api/leaderboard?class_name=${encodeURIComponent(selectedClass)}` : '/api/leaderboard';
+                const [lbRes, clRes] = await Promise.all([
+                    api(url),
+                    api('/api/classes')
+                ]);
+
+                const board = lbRes.leaderboard || [];
+                const classes = clRes.classes || [];
+
+                let myStudentRank = null;
+                if (state.user.role === 'student') {
+                    board.forEach(item => {
+                        if (item.student_id === state.user.id || item.student_login === state.user.login) {
+                            myStudentRank = item;
+                        }
+                    });
+                }
+
+                const html = `
+                    <div class="notebook-card mb-2">
+                        <div class="d-flex justify-between align-center" style="flex-wrap: wrap; gap: 14px;">
+                            <div>
+                                <h2 style="font-size: 2rem; margin: 0;">🏆 O'quvchilar Reytingi</h2>
+                                <p style="color: var(--text-muted); font-size: 0.95rem;">
+                                    Maktab va 1-11 sinflar bo'yicha baholar o'rtachasi va a'lo baholar asosidagi reyting.
+                                </p>
+                            </div>
+                            <div class="d-flex align-center" style="gap: 10px;">
+                                <label style="font-weight: 800; font-size: 0.95rem;">🏫 Sinf:</label>
+                                <select class="form-input" style="width: auto; padding: 6px 12px; font-weight: 800;" onchange="renderLeaderboardTab(document.getElementById('tabContentArea'), this.value)">
+                                    <option value="" ${!selectedClass ? 'selected' : ''}>🌐 Barcha sinflar (Maktab)</option>
+                                    ${classes.map(c => `<option value="${c.class_name}" ${selectedClass === c.class_name ? 'selected' : ''}>${c.class_name} (${c.count} o'quvchi)</option>`).join('')}
+                                </select>
+                            </div>
+                        </div>
+
+                        ${myStudentRank ? `
+                            <div class="notebook-card mt-2" style="background: var(--accent-green-light); border: 2px solid var(--accent-green);">
+                                <div class="d-flex justify-between align-center" style="flex-wrap: wrap; gap: 10px;">
+                                    <div>
+                                        <span style="font-size: 1.5rem;">${myStudentRank.medal || '🎖'}</span>
+                                        <strong style="font-size: 1.1rem; margin-left: 6px;">Sizning o'rningiz:</strong>
+                                        <span style="font-weight: 800;">${myStudentRank.rank}-o'rin</span> [${myStudentRank.class_name}]
+                                    </div>
+                                    <div style="font-size: 1rem; font-weight: 800;">
+                                        ⭐️ O'rtacha ball: <span style="font-size: 1.2rem; color: var(--accent-green);">${Number(myStudentRank.avg_grade).toFixed(2)}</span>
+                                        <span style="color: var(--text-muted); font-size: 0.9rem; margin-left: 8px;">(${myStudentRank.grades_count} ta baho)</span>
+                                    </div>
+                                </div>
+                            </div>
+                        ` : ''}
+                    </div>
+
+                    <div class="notebook-card">
+                        <div class="table-responsive">
+                            <table class="notebook-table">
+                                <thead>
+                                    <tr>
+                                        <th style="width: 70px; text-align: center;">O'rin</th>
+                                        <th>O'quvchi</th>
+                                        <th>Sinf</th>
+                                        <th style="text-align: center;">Baholar soni</th>
+                                        <th style="text-align: center;">5️⃣ A'lo</th>
+                                        <th style="text-align: center;">4️⃣ Yaxshi</th>
+                                        <th style="text-align: right;">O'rtacha ball</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${board.length === 0 ? `
+                                        <tr><td colspan="7" class="empty-state">Hozircha baholangan o'quvchilar yo'q.</td></tr>
+                                    ` : board.map(item => {
+                                        const isMe = (state.user.role === 'student' && (item.student_id === state.user.id || item.student_login === state.user.login));
+                                        const rowStyle = isMe ? 'background: var(--accent-green-light); font-weight: 800;' : '';
+                                        return `
+                                            <tr style="${rowStyle}">
+                                                <td style="text-align: center; font-size: 1.2rem; font-weight: 900;">
+                                                    ${item.medal || item.rank}
+                                                </td>
+                                                <td>
+                                                    <strong>${escapeHtml(item.student_name)}</strong>
+                                                    ${isMe ? '<span class="subject-tag" style="margin-left: 6px; background: var(--accent-green); color: white;">Siz</span>' : ''}
+                                                </td>
+                                                <td>
+                                                    <span class="subject-tag" style="background: var(--primary-light); color: var(--primary); font-weight: 800;">
+                                                        🏫 ${escapeHtml(item.class_name)}
+                                                    </span>
+                                                </td>
+                                                <td style="text-align: center; font-weight: 700;">${item.grades_count} ta</td>
+                                                <td style="text-align: center; color: var(--accent-green); font-weight: 800;">${item.fives_count}</td>
+                                                <td style="text-align: center; color: var(--primary); font-weight: 800;">${item.fours_count}</td>
+                                                <td style="text-align: right; font-weight: 900; font-size: 1.15rem; color: var(--accent-yellow);">
+                                                    ⭐️ ${Number(item.avg_grade).toFixed(2)}
+                                                </td>
+                                            </tr>
+                                        `;
+                                    }).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                `;
+                container.innerHTML = html;
+            } catch (err) {
+                container.innerHTML = `<div class="empty-state">Reytingni yuklashda xatolik: ${err.message}</div>`;
+            }
+        }
 
         // ──────────────────────── STARTUP INITIALIZATION ────────────────────────
         document.addEventListener('DOMContentLoaded', () => {

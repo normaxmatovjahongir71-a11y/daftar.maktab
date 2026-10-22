@@ -37,7 +37,7 @@ import pytz
 from database import Database
 from auth import create_token, verify_token
 from notifications import (
-    notify_parents_grade, notify_parents_attendance, notify_parents_notice,
+    notify_student_grade, notify_parents_grade, notify_parents_attendance, notify_parents_notice,
     send_daily_digests_job, get_parent_settings_markup
 )
 
@@ -306,7 +306,8 @@ def api_delete_task(task_id):
 def api_get_students():
     if not require_teacher_role():
         return error_response("Ruxsat yo'q", 403)
-    return jsonify({'students': db.get_students()})
+    class_name = request.args.get('class_name')
+    return jsonify({'students': db.get_students(class_name=class_name)})
 
 
 @flask_app.route('/api/students', methods=['POST'])
@@ -317,12 +318,38 @@ def api_add_student():
     name = data.get('name', '').strip()
     login = data.get('login', '').strip()
     password = data.get('password', '').strip()
+    class_name = data.get('class_name', '5-sinf').strip()
     if not name or not login or len(password) < 4:
         return error_response("Ism, login va parol (kamida 4 belgi) kerak.")
-    sid = db.create_student(name, login, password)
+    sid = db.create_student(name, login, password, class_name=class_name)
     if sid:
         return jsonify({'success': True, 'id': sid})
     return error_response(f"'{login}' login allaqachon band.", 409)
+
+
+@flask_app.route('/api/students/<int:student_id>/class', methods=['PUT'])
+def api_update_student_class(student_id):
+    if not require_teacher_role():
+        return error_response("Ruxsat yo'q", 403)
+    data = request.get_json(silent=True) or {}
+    class_name = data.get('class_name', '').strip()
+    if not class_name:
+        return error_response("class_name kerak")
+    updated = db.update_student_class(student_id, class_name)
+    return jsonify({'success': True, 'class_name': updated})
+
+
+@flask_app.route('/api/classes', methods=['GET'])
+def api_get_classes():
+    return jsonify({'classes': db.get_classes_summary()})
+
+
+@flask_app.route('/api/leaderboard', methods=['GET'])
+def api_get_leaderboard():
+    class_name = request.args.get('class_name')
+    limit = int(request.args.get('limit', 50))
+    board = db.get_leaderboard(class_name=class_name, limit=limit)
+    return jsonify({'leaderboard': board})
 
 
 @flask_app.route('/api/students/<int:student_id>', methods=['DELETE'])
@@ -380,15 +407,21 @@ def api_add_grade():
     teacher_name = teacher_user.get('login', "O'qituvchi")
     gid = db.add_grade(int(student_id), subject, int(grade), comment=comment, teacher_name=teacher_name)
 
-    # Ota-onalarga avtomatik xabar
+    # O'quvchining o'ziga va Ota-onalarga bir vaqtda avtomatik xabar yuborish
     if tg_application and tg_application.bot and bot_loop:
         try:
+            # 1. O'quvchining o'ziga darhol xabar
+            asyncio.run_coroutine_threadsafe(
+                notify_student_grade(tg_application.bot, db, int(student_id), subject, int(grade), teacher_name, comment),
+                bot_loop
+            )
+            # 2. Ota-onalariga avtomatik xabar
             asyncio.run_coroutine_threadsafe(
                 notify_parents_grade(tg_application.bot, db, int(student_id), subject, int(grade), teacher_name, comment),
                 bot_loop
             )
         except Exception as e:
-            logger.warning(f"Ota-onaga baho xabarini yuborishda: {e}")
+            logger.warning(f"Baho xabarnomasini yuborishda: {e}")
 
     return jsonify({'success': True, 'id': gid})
 
@@ -633,10 +666,11 @@ def get_admin_keyboard():
     """Adminlar uchun boshqaruv tugmalari."""
     keyboard = [
         [KeyboardButton("➕ O'quvchi ochish"), KeyboardButton("👨‍🏫 O'qituvchi ochish")],
-        [KeyboardButton("📋 O'quvchilar ro'yxati"), KeyboardButton("👥 O'qituvchilar ro'yxati")],
-        [KeyboardButton("⭐ Baho qo'yish"), KeyboardButton("⏰ Davomat belgilash")],
-        [KeyboardButton("🔑 Ota-ona PIN kodi"), KeyboardButton("📊 Tizim statistikasi")],
-        [KeyboardButton("🔑 Admin kodi"), KeyboardButton("🔙 Asosiy menyu")]
+        [KeyboardButton("📋 O'quvchilar ro'yxati"), KeyboardButton("🏫 Sinflar (1-11)")],
+        [KeyboardButton("🏆 Reyting"), KeyboardButton("⭐ Baho qo'yish")],
+        [KeyboardButton("⏰ Davomat belgilash"), KeyboardButton("🔑 Ota-ona PIN kodi")],
+        [KeyboardButton("📊 Tizim statistikasi"), KeyboardButton("🔑 Admin kodi")],
+        [KeyboardButton("🔙 Asosiy menyu")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -657,6 +691,7 @@ def get_main_keyboard(chat_id: int):
         keyboard = [
             [top_btn],
             [KeyboardButton("📊 Farzandim baholari"), KeyboardButton("⏰ Davomat nazorati")],
+            [KeyboardButton("🏆 Reyting"), KeyboardButton("🏫 Sinflar (1-11)")],
             [KeyboardButton("📝 Uy vazifalari"), KeyboardButton("📅 Dars jadvali")],
             [KeyboardButton("⚙️ Bildirishnoma sozlamalari"), KeyboardButton("🔑 Profil / Kirish")]
         ]
@@ -670,7 +705,8 @@ def get_main_keyboard(chat_id: int):
     # Standart o'quvchi / o'qituvchi menyusi
     keyboard = [
         [top_btn],
-        [KeyboardButton("📊 Baholarim"), KeyboardButton("📅 Dars jadvali")],
+        [KeyboardButton("📊 Baholarim"), KeyboardButton("🏆 Reyting")],
+        [KeyboardButton("🏫 Sinflar (1-11)"), KeyboardButton("📅 Dars jadvali")],
         [KeyboardButton("📝 Uy vazifalari"), KeyboardButton("🏆 Imtihonlar")],
         [KeyboardButton("📷 Rasm yuklash (Uy ishi)"), KeyboardButton("🔑 Profil / Kirish")]
     ]
@@ -1258,26 +1294,36 @@ async def cmd_baholarim(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_oquvchi_qosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     teacher = db.get_teacher_by_chat_id(chat_id)
-    if not teacher:
+    if not (teacher or db.is_admin(chat_id)):
         await reply_safe(update, "❌ Siz o'qituvchi sifatida kirmagansiz. `/oqituvchi login parol`", parse_mode='Markdown')
         return
     if len(context.args) < 3:
-        await reply_safe(update, "❌ Foydalanish: `/oquvchi_qosh Ism login parol`", parse_mode='Markdown')
+        await reply_safe(
+            update,
+            "❌ <b>Foydalanish:</b> <code>/oquvchi_qosh [Ism] [login] [parol] [sinf(ixtiyoriy)]</code>\n\n"
+            "Misollar:\n"
+            "• <code>/oquvchi_qosh Ali ali ali123 7-sinf</code>\n"
+            "• <code>/oquvchi_qosh Madina madina m1234 9-A</code>",
+            parse_mode='HTML'
+        )
         return
     name, login, password = context.args[0], context.args[1], context.args[2]
+    raw_class = context.args[3] if len(context.args) > 3 else "5-sinf"
     if len(password) < 4:
         await reply_safe(update, "❌ Parol kamida 4 belgidan iborat bo'lishi kerak.")
         return
-    result = db.create_student(name, login, password)
+    norm_class = db.normalize_class_name(raw_class)
+    result = db.create_student(name, login, password, class_name=norm_class)
     if result:
         await reply_safe(
             update,
-            f"✅ *O'quvchi muvaffaqiyatli qo'shildi!*\n\n"
-            f"👤 Ism: *{name}*\n"
-            f"🔑 Login: `{login}`\n"
-            f"🔒 Parol: `{password}`\n\n"
-            f"O'quvchi botga kirishi uchun: `/kirish {login} {password}`",
-            parse_mode='Markdown'
+            f"✅ <b>O'quvchi muvaffaqiyatli qo'shildi!</b>\n\n"
+            f"👤 <b>Ism:</b> {name}\n"
+            f"🏫 <b>Sinf:</b> <b>{norm_class}</b>\n"
+            f"🔑 <b>Login:</b> <code>{login}</code>\n"
+            f"🔒 <b>Parol:</b> <code>{password}</code>\n\n"
+            f"O'quvchi botga kirishi uchun: <code>/kirish {login} {password}</code>",
+            parse_mode='HTML'
         )
     else:
         await reply_safe(update, f"❌ '{login}' login allaqachon band.")
@@ -1286,21 +1332,25 @@ async def cmd_oquvchi_qosh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_oquvchilar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     teacher = db.get_teacher_by_chat_id(chat_id)
-    if not teacher:
-        await reply_safe(update, "❌ Bu buyruq faqat o'qituvchilar uchun.")
+    if not (teacher or db.is_admin(chat_id)):
+        await reply_safe(update, "❌ Bu buyruq faqat o'qituvchilar va adminlar uchun.")
         return
-    students = db.get_students()
+    class_filter = db.normalize_class_name(context.args[0]) if context.args else None
+    students = db.get_students(class_name=class_filter)
     if not students:
-        await reply_safe(update, "📭 O'quvchilar hali kiritilmagan.")
+        filter_str = f" ({class_filter})" if class_filter else ""
+        await reply_safe(update, f"📭 O'quvchilar hali kiritilmagan{filter_str}.")
         return
-    text = "👨‍🎓 *O'QUVCHILAR RO'YXATI:*\n━━━━━━━━━━━━━━━━━━━━━━\n"
+    title_str = f" ({class_filter})" if class_filter else ""
+    text = f"👨‍🎓 <b>O'QUVCHILAR RO'YXATI{title_str}:</b>\n━━━━━━━━━━━━━━━━━━━━━━\n"
     for i, s in enumerate(students, 1):
         avg = db.get_student_average(s['id'])
-        avg_str = f"{avg:.2f}" if avg else "—"
+        avg_str = f"{avg:.2f} ⭐️" if avg else "—"
         connected = "🟢 (Telegram ulangan)" if s.get('telegram_chat_id') else "⚪"
-        text += f"*{i}. {s['name']}* (`{s['login']}`)\n"
-        text += f"   └── O'rtacha: *{avg_str}* | {connected}\n\n"
-    await reply_safe(update, text, parse_mode='Markdown')
+        s_class = s.get('class_name', '5-sinf')
+        text += f"<b>{i}. {s['name']}</b> [🏫 {s_class}] (<code>{s['login']}</code>)\n"
+        text += f"   └── O'rtacha: <b>{avg_str}</b> | {connected}\n\n"
+    await reply_safe(update, text, parse_mode='HTML')
 
 
 async def cmd_baho(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1330,7 +1380,10 @@ async def cmd_baho(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db.add_grade(student['id'], subject, grade, comment=comment, teacher_name=teacher_name)
 
-    # Ota-onalarga avtomatik bildirishnoma tarqatish
+    # 1. O'quvchining o'ziga darhol avtomatik xabar yuborish
+    await notify_student_grade(context.bot, db, student['id'], subject, grade, teacher_name, comment)
+
+    # 2. Ota-onalariga avtomatik bildirishnoma tarqatish
     await notify_parents_grade(context.bot, db, student['id'], subject, grade, teacher_name, comment)
 
     emoji = _grade_emoji(grade)
@@ -1338,11 +1391,226 @@ async def cmd_baho(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_safe(
         update,
         f"✅ *Baho qo'yildi!*\n\n"
-        f"👤 O'quvchi: *{student['name']}*\n"
+        f"👤 O'quvchi: *{student['name']}* [🏫 {student.get('class_name', '5-sinf')}]\n"
         f"📘 Fan: *{subject}*\n"
         f"⭐ Baho: {emoji}{comment_text}\n\n"
-        f"💡 _O'quvchining ota-onalariga avtomatik bildirishnoma yetkazildi._",
+        f"💡 _O'quvchining o'ziga va ota-onalariga bir zumda avtomatik xabar yetkazildi!_",
         parse_mode='Markdown'
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+#                 REYTING VA SINFLAR (1-11)
+# ══════════════════════════════════════════════════════════════
+
+def get_leaderboard_markup(active_class=None):
+    """Reyting uchun sinf tanlash tugmalari."""
+    btns = []
+    school_text = "🌐 Butun maktab (Barcha sinflar)" if active_class else "✅ 🌐 Butun maktab (Barcha sinflar)"
+    btns.append([InlineKeyboardButton(school_text, callback_data="lb_class_all")])
+
+    row1 = [InlineKeyboardButton(f"{'✅ ' if active_class == f'{i}-sinf' else ''}{i}-sinf", callback_data=f"lb_class_{i}") for i in range(1, 5)]
+    row2 = [InlineKeyboardButton(f"{'✅ ' if active_class == f'{i}-sinf' else ''}{i}-sinf", callback_data=f"lb_class_{i}") for i in range(5, 9)]
+    row3 = [InlineKeyboardButton(f"{'✅ ' if active_class == f'{i}-sinf' else ''}{i}-sinf", callback_data=f"lb_class_{i}") for i in range(9, 12)]
+    btns.extend([row1, row2, row3])
+    return InlineKeyboardMarkup(btns)
+
+
+def format_leaderboard_text(board, class_title="Butun maktab", viewer_student=None):
+    """Reyting xabari matni."""
+    text = (
+        f"🏆 <b>O'QUVCHILAR REYTINGI (BAHOLAR BO'YICHA)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏫 <b>Bo'lim:</b> <b>{class_title}</b>\n"
+        f"👥 <b>Baholangan o'quvchilar:</b> {len(board)} nafar\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+    if not board:
+        text += "📭 <i>Hozircha baholar qo'yilmagan yoki o'quvchilar mavjud emas.</i>\n"
+    else:
+        for item in board[:15]:
+            medal = item.get('medal', f"{item['rank']}.")
+            avg = item.get('avg_grade', 0.0)
+            count = item.get('grades_count', 0)
+            s_name = item.get('student_name', '')
+            s_class = item.get('class_name', '')
+            highlight = " 👈 <i>(Siz)</i>" if viewer_student and viewer_student.get('id') == item.get('student_id') else ""
+
+            text += f"{medal} <b>{s_name}</b> [🏫 {s_class}]{highlight}\n"
+            text += f"   └── ⭐️ O'rtacha: <b>{avg:.2f}</b> | Baholar: <b>{count} ta</b>\n"
+
+    if viewer_student:
+        sid = viewer_student.get('id')
+        rank_data = db.get_student_rank(sid)
+        if rank_data:
+            text += (
+                f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>Sizning shaxsiy natijangiz:</b>\n"
+                f"• Maktab bo'yicha: <b>{rank_data['school_rank']}-o'rin</b> ({rank_data['school_total']} ta o'quvchi ichida)\n"
+                f"• {rank_data['class_name']} bo'yicha: <b>{rank_data['class_rank']}-o'rin</b> ({rank_data['class_total']} ta ichida)\n"
+                f"• Shaxsiy o'rtacha balingiz: ⭐️ <b>{rank_data['avg_grade']:.2f}</b> ({rank_data['grades_count']} ta baho)"
+            )
+    return text
+
+
+async def cmd_reyting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Baho bo'yicha maktab va sinflar reytingini ko'rsatish."""
+    chat_id = update.effective_chat.id
+    student = db.get_student_by_chat_id(chat_id)
+    class_filter = None
+    title = "Butun maktab"
+    if context.args:
+        class_filter = db.normalize_class_name(context.args[0])
+        title = class_filter
+
+    board = db.get_leaderboard(class_name=class_filter, limit=20)
+    text = format_leaderboard_text(board, class_title=title, viewer_student=student)
+    markup = get_leaderboard_markup(active_class=class_filter)
+    await reply_safe(update, text, parse_mode="HTML", reply_markup=markup)
+
+
+async def leaderboard_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reytingdagi sinf almashtirish callbacki."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = update.effective_chat.id
+    student = db.get_student_by_chat_id(chat_id)
+
+    if data == "lb_class_all":
+        class_filter = None
+        title = "Butun maktab"
+    elif data.startswith("lb_class_"):
+        c_num = data.replace("lb_class_", "")
+        class_filter = f"{c_num}-sinf"
+        title = class_filter
+    else:
+        return
+
+    board = db.get_leaderboard(class_name=class_filter, limit=20)
+    text = format_leaderboard_text(board, class_title=title, viewer_student=student)
+    markup = get_leaderboard_markup(active_class=class_filter)
+    try:
+        await query.edit_message_text(text=text, parse_mode="HTML", reply_markup=markup)
+    except Exception:
+        pass
+
+
+def get_classes_markup():
+    """1-11 sinflar bo'yicha navigatsiya tugmalari."""
+    btns = []
+    row1 = [InlineKeyboardButton(f"{i}-sinf", callback_data=f"view_class_{i}") for i in range(1, 5)]
+    row2 = [InlineKeyboardButton(f"{i}-sinf", callback_data=f"view_class_{i}") for i in range(5, 9)]
+    row3 = [InlineKeyboardButton(f"{i}-sinf", callback_data=f"view_class_{i}") for i in range(9, 12)]
+    btns.extend([row1, row2, row3])
+    return InlineKeyboardMarkup(btns)
+
+
+async def cmd_sinflar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """1-11 sinflar umumiy ro'yxati va o'quvchilar soni."""
+    summary = db.get_classes_summary()
+    total_students = sum(c['count'] for c in summary)
+
+    text = (
+        "🏫 <b>MAKTAB SINFLARI (1-11 GACHA)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Jami o'quvchilar:</b> {total_students} nafar\n\n"
+    )
+    for c in summary:
+        cnt = c['count']
+        status = f"<b>{cnt} nafar</b> o'quvchi" if cnt > 0 else "<i>bo'sh</i>"
+        text += f"• <b>{c['class_name']}:</b> {status}\n"
+
+    text += (
+        "\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 <i>Istalgan sinf o'quvchilarini ko'rish uchun quyidagi tugmalardan birini bosing:</i>"
+    )
+    markup = get_classes_markup()
+    await reply_safe(update, text, parse_mode="HTML", reply_markup=markup)
+
+
+async def view_class_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sinf o'quvchilarini ko'rish callbacki."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "view_all_classes":
+        summary = db.get_classes_summary()
+        total_students = sum(c['count'] for c in summary)
+        text = (
+            "🏫 <b>MAKTAB SINFLARI (1-11 GACHA)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 <b>Jami o'quvchilar:</b> {total_students} nafar\n\n"
+        )
+        for c in summary:
+            cnt = c['count']
+            status = f"<b>{cnt} nafar</b> o'quvchi" if cnt > 0 else "<i>bo'sh</i>"
+            text += f"• <b>{c['class_name']}:</b> {status}\n"
+        text += "\n💡 <i>Sinfni tanlang:</i>"
+        markup = get_classes_markup()
+        try:
+            await query.edit_message_text(text=text, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            pass
+        return
+
+    c_num = data.replace("view_class_", "")
+    class_name = f"{c_num}-sinf"
+
+    students = db.get_students(class_name=class_name)
+    text = (
+        f"🏫 <b>{class_name} O'QUVCHILARI RO'YXATI</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 <b>Sinfdagi jami:</b> {len(students)} nafar\n\n"
+    )
+    if not students:
+        text += "📭 <i>Ushbu sinfda hali o'quvchilar ro'yxatga olinmagan.</i>\n\n"
+        text += f"O'qituvchi o'quvchi qo'shishi uchun:\n<code>/oquvchi_qosh Ism login parol {class_name}</code>"
+    else:
+        for idx, s in enumerate(students, 1):
+            avg = db.get_student_average(s['id'])
+            avg_str = f"{avg:.2f} ⭐️" if avg else "—"
+            connected = "🟢" if s.get('telegram_chat_id') else "⚪"
+            text += f"<b>{idx}. {s['name']}</b> (<code>{s['login']}</code>)\n"
+            text += f"   └── O'rtacha: <b>{avg_str}</b> | Telegram: {connected}\n"
+
+    back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Barcha sinflarga qaytish", callback_data="view_all_classes")]])
+    try:
+        await query.edit_message_text(text=text, parse_mode="HTML", reply_markup=back_btn)
+    except Exception:
+        pass
+
+
+async def cmd_sinf_ozgartir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """O'quvchini boshqa sinfga o'tkazish (faqat o'qituvchi/admin)."""
+    chat_id = update.effective_chat.id
+    if not (db.get_teacher_by_chat_id(chat_id) or db.is_admin(chat_id)):
+        await reply_safe(update, "❌ Bu buyruq faqat o'qituvchilar va adminlar uchun.")
+        return
+    if len(context.args) < 2:
+        await reply_safe(
+            update,
+            "❌ <b>Foydalanish:</b> <code>/sinf_ozgartir [login] [yangi_sinf]</code>\n\n"
+            "Misollar:\n"
+            "• <code>/sinf_ozgartir ali 7-sinf</code>\n"
+            "• <code>/sinf_ozgartir ali 8-A</code>",
+            parse_mode="HTML"
+        )
+        return
+    login = context.args[0].strip()
+    new_class = context.args[1].strip()
+    student = db.get_student_by_login(login)
+    if not student:
+        await reply_safe(update, f"❌ '{login}' loginli o'quvchi topilmadi.")
+        return
+    norm = db.update_student_class(student['id'], new_class)
+    await reply_safe(
+        update,
+        f"✅ <b>O'quvchi sinfi muvaffaqiyatli o'zgartirildi!</b>\n\n"
+        f"👤 <b>O'quvchi:</b> {student['name']} (<code>{student['login']}</code>)\n"
+        f"🏫 <b>Yangi sinf:</b> <b>{norm}</b>",
+        parse_mode="HTML"
     )
 
 
@@ -1555,6 +1823,12 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
     elif text in ["📊 Baholarim", "Baholar", "baholar"]:
         await show_grades_view(update, context)
+    elif text in ["🏆 Reyting", "Reyting", "reyting", "Top", "top"]:
+        await cmd_reyting(update, context)
+        return
+    elif text in ["🏫 Sinflar (1-11)", "🏫 Sinflar", "Sinflar", "sinflar"]:
+        await cmd_sinflar(update, context)
+        return
     elif text in ["📊 Farzandim baholari", "Farzandim baholari"]:
         parent = db.get_parent_by_chat_id(chat_id)
         if parent and parent.get('children'):
@@ -1656,10 +1930,12 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
             parts = [p.strip() for p in text.replace(',', '|').split('|') if p.strip()]
             if len(parts) >= 3:
                 name, login, password = parts[0], parts[1], parts[2]
+                raw_class = parts[3] if len(parts) > 3 else "5-sinf"
+                norm_class = db.normalize_class_name(raw_class)
                 if len(password) < 4:
                     await reply_safe(update, "❌ Parol kamida 4 belgidan iborat bo'lishi kerak. Qayta urinib ko'ring:")
                     return
-                sid = db.create_student(name, login, password)
+                sid = db.create_student(name, login, password, class_name=norm_class)
                 admin_states.pop(chat_id, None)
                 if sid:
                     await reply_safe(
@@ -1667,6 +1943,7 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
                         f"✅ *Yangi o'quvchi hisobi yaratildi!*\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━\n"
                         f"👤 Ism: *{name}*\n"
+                        f"🏫 Sinf: *{norm_class}*\n"
                         f"🔑 Login: `{login}`\n"
                         f"🔒 Parol: `{password}`\n\n"
                         f"O'quvchi botga kirishi uchun:\n`/kirish {login} {password}`",
@@ -1681,8 +1958,8 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
                     update,
                     "⚠️ *Noto'g'ri format!*\n"
                     "Iltimos, quyidagicha ajratib yozing:\n"
-                    "`Ism Familiya | login | parol`\n\n"
-                    "Misol: `Aziz Rahimov | aziz123 | aziz2026`\n"
+                    "`Ism Familiya | login | parol [| sinf]`\n\n"
+                    "Misol: `Aziz Rahimov | aziz123 | aziz2026 | 7-sinf`\n"
                     "Yoki bekor qilish uchun /cancel yozing.",
                     parse_mode='Markdown'
                 )
@@ -1970,6 +2247,10 @@ async def main():
     application.add_handler(CommandHandler("oquvchi_qosh", cmd_oquvchi_qosh))
     application.add_handler(CommandHandler("oquvchilar", cmd_oquvchilar))
     application.add_handler(CommandHandler("baho", cmd_baho))
+    application.add_handler(CommandHandler("reyting", cmd_reyting))
+    application.add_handler(CommandHandler("top", cmd_reyting))
+    application.add_handler(CommandHandler("sinflar", cmd_sinflar))
+    application.add_handler(CommandHandler("sinf_ozgartir", cmd_sinf_ozgartir))
     application.add_handler(CommandHandler("pin", cmd_pin))
     application.add_handler(CommandHandler("otaona_kod", cmd_pin))
     application.add_handler(CommandHandler("davomat", cmd_davomat))
@@ -1982,6 +2263,10 @@ async def main():
     application.add_handler(CallbackQueryHandler(schedule_callback_handler, pattern="^sched_"))
     # Ota-ona bildirishnoma sozlamalari callbacklari
     application.add_handler(CallbackQueryHandler(parent_settings_callback_handler, pattern="^toggle_notify_"))
+    # Reyting callbacklari
+    application.add_handler(CallbackQueryHandler(leaderboard_callback_handler, pattern="^lb_class_"))
+    # Sinflar callbacklari
+    application.add_handler(CallbackQueryHandler(view_class_callback_handler, pattern="^(view_class_|view_all_classes)"))
 
     # Rasm yuborish
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
@@ -2002,6 +2287,9 @@ async def main():
         commands = [
             BotCommand("start", "📓 Boshlash va menyuni ochish"),
             BotCommand("baholarim", "📊 Baholarim va o'rtacha ball"),
+            BotCommand("reyting", "🏆 Baholar bo'yicha reyting"),
+            BotCommand("sinflar", "🏫 1-11 sinflar ro'yxati"),
+            BotCommand("sinf_ozgartir", "🔄 O'quvchi sinfini o'zgartirish"),
             BotCommand("otaona", "👪 Ota-ona kabineti"),
             BotCommand("pin", "🔑 Ota-onani ulash PIN-kodi"),
             BotCommand("davomat", "📋 Davomat kiritish (kelmadi/kechikdi)"),

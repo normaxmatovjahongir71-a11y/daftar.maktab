@@ -14,6 +14,39 @@ logger = logging.getLogger(__name__)
 #              1. TELEGRAM HTML XABAR SHABLONLARI
 # ══════════════════════════════════════════════════════════════
 
+def format_student_grade_alert(student_name: str, subject: str, grade: int, teacher_name: str = "", comment: str = None, avg_grade: float = None, rank_info: dict = None) -> str:
+    """O'quvchining o'ziga yangi baho qo'yilganda darhol boradigan xabarnoma shabloni."""
+    grade_emojis = {
+        5: "5️⃣ 🟢 (A'lo)",
+        4: "4️⃣ 🔵 (Yaxshi)",
+        3: "3️⃣ 🟡 (Qoniqarli)",
+        2: "2️⃣ 🔴 (Qoniqarsiz)"
+    }
+    grade_badge = grade_emojis.get(grade, f"⭐ {grade}")
+    t_name = teacher_name or "O'qituvchi"
+    now_str = datetime.now().strftime("%d.%m.%Y, %H:%M")
+
+    html = (
+        "🎉 <b>SIZGA YANGI BAHO QO'YILDI!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📘 <b>Fan:</b> <b>{subject}</b>\n"
+        f"⭐️ <b>Baho:</b> <b>{grade_badge}</b>\n"
+        f"👨‍🏫 <b>O'qituvchi:</b> {t_name}\n"
+    )
+    if comment and comment.strip():
+        html += f"💬 <b>Izoh:</b> <i>«{comment.strip()}»</i>\n"
+    html += f"📅 <b>Vaqt:</b> {now_str}\n"
+    html += "━━━━━━━━━━━━━━━━━━━━━━\n"
+
+    if avg_grade:
+        html += f"📊 <b>Joriy o'rtacha balingiz:</b> <b>{avg_grade:.2f}</b>\n"
+    if rank_info and rank_info.get('class_rank'):
+        html += f"🏆 <b>Sinfdagi o'rningiz:</b> <b>{rank_info['class_rank']}-o'rin</b> ({rank_info.get('class_name', '')})\n"
+
+    html += "\n💡 <i>O'qishda davom eting va reytingda eng yuqori o'ringa ko'tariling!</i> 🚀"
+    return html
+
+
 def format_grade_alert(student_name: str, subject: str, grade: int, teacher_name: str = "", comment: str = None) -> str:
     """Yangi baho qo'yilganda yuboriladigan HTML shablon."""
     grade_emojis = {
@@ -187,6 +220,39 @@ def is_quiet_hours(start_str: str, end_str: str) -> bool:
             return start_t <= now_time <= end_t
         return now_time >= start_t or now_time <= end_t
     except Exception:
+        return False
+
+
+async def notify_student_grade(bot, db, student_id: int, subject: str, grade: int, teacher_name: str = "", comment: str = None):
+    """Baho qo'yilganda o'quvchining o'ziga darhol shaxsiy xabar yuborish."""
+    try:
+        student = db.get_student_by_id(student_id)
+        if not student:
+            return False
+        chat_id = student.get('telegram_chat_id')
+        if not chat_id:
+            return False
+
+        avg = db.get_student_average(student_id)
+        rank_info = db.get_student_rank(student_id)
+        text = format_student_grade_alert(
+            student_name=student['name'],
+            subject=subject,
+            grade=grade,
+            teacher_name=teacher_name,
+            comment=comment,
+            avg_grade=avg,
+            rank_info=rank_info
+        )
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="HTML"
+        )
+        logger.info(f"O'quvchiga ({student['login']}) baho xabarnomasi yuborildi: chat {chat_id}")
+        return True
+    except Exception as e:
+        logger.warning(f"O'quvchiga baho bildirishnomasini yuborishda xato ({student_id}): {e}")
         return False
 
 

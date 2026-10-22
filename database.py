@@ -166,6 +166,14 @@ class Database:
                 conn.execute("ALTER TABLE grades ADD COLUMN teacher_name TEXT DEFAULT ''")
         except Exception:
             pass
+
+        # Students jadvaliga class_name (sinf) ustunini tekshirish va qo'shish (1-11 sinflar)
+        try:
+            s_cols = [c[1] for c in conn.execute('PRAGMA table_info(students)').fetchall()]
+            if 'class_name' not in s_cols:
+                conn.execute("ALTER TABLE students ADD COLUMN class_name TEXT DEFAULT '5-sinf'")
+        except Exception:
+            pass
         # Jadval kataklarini yaratish (Dush-Shanba, 7 dars)
         for day in range(1, 7):
             for slot in range(1, 8):
@@ -341,15 +349,38 @@ class Database:
             'admins': admins_count
         }
 
-    # ==================== O'quvchilar ====================
+    # ==================== O'quvchilar va Sinflar (1-11) ====================
 
-    def create_student(self, name, login, password):
+    @staticmethod
+    def normalize_class_name(raw_class):
+        """Sinf nomini 1-11 gacha standart formatga keltiradi (masalan: 7 -> 7-sinf, 7a -> 7-A)."""
+        if not raw_class:
+            return "5-sinf"
+        s = str(raw_class).strip()
+        if s.isdigit():
+            n = int(s)
+            if 1 <= n <= 11:
+                return f"{n}-sinf"
+            return "5-sinf"
+        import re
+        m = re.match(r'^(\d{1,2})\s*[-_]?\s*([a-zA-Zа-яА-Я]?|sinf)$', s, re.IGNORECASE)
+        if m:
+            num = int(m.group(1))
+            suffix = m.group(2)
+            if 1 <= num <= 11:
+                if not suffix or suffix.lower() == 'sinf':
+                    return f"{num}-sinf"
+                return f"{num}-{suffix.upper()}"
+        return s[:15] if s else "5-sinf"
+
+    def create_student(self, name, login, password, class_name='5-sinf'):
         pw_hash, salt = hash_password(password)
+        normalized_class = self.normalize_class_name(class_name)
         conn = self._conn()
         try:
             conn.execute(
-                'INSERT INTO students (name, login, password_hash, salt) VALUES (?, ?, ?, ?)',
-                (name, login, pw_hash, salt)
+                'INSERT INTO students (name, login, password_hash, salt, class_name) VALUES (?, ?, ?, ?, ?)',
+                (name, login, pw_hash, salt, normalized_class)
             )
             conn.commit()
             sid = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
@@ -369,18 +400,31 @@ class Database:
             return dict(row)
         return None
 
-    def get_students(self):
+    def get_students(self, class_name=None):
         conn = self._conn()
-        rows = conn.execute(
-            'SELECT id, name, login, telegram_chat_id FROM students ORDER BY name'
-        ).fetchall()
+        if class_name:
+            norm = self.normalize_class_name(class_name)
+            rows = conn.execute(
+                '''SELECT id, name, login, COALESCE(class_name, '5-sinf') as class_name, telegram_chat_id 
+                   FROM students 
+                   WHERE class_name = ? OR class_name LIKE ?
+                   ORDER BY name''',
+                (norm, f"{norm}%")
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                '''SELECT id, name, login, COALESCE(class_name, '5-sinf') as class_name, telegram_chat_id 
+                   FROM students 
+                   ORDER BY class_name, name'''
+            ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
 
     def get_student_by_id(self, student_id):
         conn = self._conn()
         row = conn.execute(
-            'SELECT id, name, login, telegram_chat_id FROM students WHERE id = ?',
+            '''SELECT id, name, login, COALESCE(class_name, '5-sinf') as class_name, telegram_chat_id 
+               FROM students WHERE id = ?''',
             (student_id,)
         ).fetchone()
         conn.close()
@@ -389,11 +433,51 @@ class Database:
     def get_student_by_login(self, login):
         conn = self._conn()
         row = conn.execute(
-            'SELECT id, name, login, telegram_chat_id FROM students WHERE login = ?',
+            '''SELECT id, name, login, COALESCE(class_name, '5-sinf') as class_name, telegram_chat_id 
+               FROM students WHERE login = ?''',
             (login,)
         ).fetchone()
         conn.close()
         return dict(row) if row else None
+
+    def update_student_class(self, student_id_or_login, new_class_name):
+        """O'quvchining sinfini yangilash (1-11 sinflar)."""
+        norm_class = self.normalize_class_name(new_class_name)
+        conn = self._conn()
+        if isinstance(student_id_or_login, int) or str(student_id_or_login).isdigit():
+            conn.execute('UPDATE students SET class_name = ? WHERE id = ?', (norm_class, int(student_id_or_login)))
+        else:
+            conn.execute('UPDATE students SET class_name = ? WHERE login = ?', (norm_class, str(student_id_or_login)))
+        conn.commit()
+        conn.close()
+        return norm_class
+
+    def get_classes_summary(self):
+        """1-11 sinflarning umumiy ro'yxati va o'quvchilar soni."""
+        conn = self._conn()
+        # Barcha o'quvchilar sinflari bo'yicha hisoblash
+        rows = conn.execute(
+            '''SELECT COALESCE(class_name, '5-sinf') as class_name, COUNT(*) as count 
+               FROM students 
+               GROUP BY class_name 
+               ORDER BY class_name'''
+        ).fetchall()
+        class_counts = {r['class_name']: r['count'] for r in rows}
+        conn.close()
+
+        # 1-11 standart sinflarni kafolatlash
+        standard_classes = [f"{i}-sinf" for i in range(1, 12)]
+        result = []
+        for c in standard_classes:
+            result.append({
+                'class_name': c,
+                'count': class_counts.get(c, 0)
+            })
+        # Standartdan tashqari boshqa sinflar (masalan 7-A, 9-B) bo'lsa qo'shish
+        for c, cnt in class_counts.items():
+            if c not in standard_classes:
+                result.append({'class_name': c, 'count': cnt})
+        return result
 
     def delete_student(self, student_id):
         conn = self._conn()
@@ -423,11 +507,110 @@ class Database:
     def get_student_by_chat_id(self, chat_id):
         conn = self._conn()
         row = conn.execute(
-            'SELECT id, name, login FROM students WHERE telegram_chat_id = ?',
+            '''SELECT id, name, login, COALESCE(class_name, '5-sinf') as class_name 
+               FROM students WHERE telegram_chat_id = ?''',
             (chat_id,)
         ).fetchone()
         conn.close()
         return dict(row) if row else None
+
+    # ==================== Baholar bo'yicha Reyting (Leaderboard) ====================
+
+    def get_leaderboard(self, class_name=None, limit=50):
+        """
+        O'quvchilar reytingi (o'rtacha ball, baholar soni va a'lo baholar bo'yicha).
+        class_name ko'rsatilsa faqat shu sinf reytingi olinadi.
+        """
+        conn = self._conn()
+        where_clause = ""
+        params = []
+        if class_name:
+            norm = self.normalize_class_name(class_name)
+            where_clause = "WHERE s.class_name = ? OR s.class_name LIKE ?"
+            params = [norm, f"{norm}%"]
+
+        sql = f'''
+            SELECT 
+                s.id as student_id,
+                s.name as student_name,
+                s.login as student_login,
+                COALESCE(s.class_name, '5-sinf') as class_name,
+                s.telegram_chat_id,
+                COUNT(g.id) as grades_count,
+                COALESCE(ROUND(AVG(g.grade), 2), 0.0) as avg_grade,
+                COALESCE(SUM(g.grade), 0) as total_score,
+                SUM(CASE WHEN g.grade = 5 THEN 1 ELSE 0 END) as fives_count,
+                SUM(CASE WHEN g.grade = 4 THEN 1 ELSE 0 END) as fours_count,
+                SUM(CASE WHEN g.grade = 3 THEN 1 ELSE 0 END) as threes_count,
+                SUM(CASE WHEN g.grade = 2 THEN 1 ELSE 0 END) as twos_count
+            FROM students s
+            LEFT JOIN grades g ON s.id = g.student_id
+            {where_clause}
+            GROUP BY s.id
+            ORDER BY 
+                avg_grade DESC, 
+                grades_count DESC, 
+                fives_count DESC, 
+                total_score DESC, 
+                s.name ASC
+            LIMIT {int(limit)}
+        '''
+        rows = conn.execute(sql, params).fetchall()
+        conn.close()
+
+        result = []
+        for idx, r in enumerate(rows, 1):
+            row_dict = dict(r)
+            row_dict['rank'] = idx
+            if idx == 1:
+                row_dict['medal'] = '🥇'
+            elif idx == 2:
+                row_dict['medal'] = '🥈'
+            elif idx == 3:
+                row_dict['medal'] = '🥉'
+            else:
+                row_dict['medal'] = f"{idx}."
+            result.append(row_dict)
+        return result
+
+    def get_student_rank(self, student_id):
+        """Bitta o'quvchining maktab va o'z sinfidagi aniq o'rni."""
+        student = self.get_student_by_id(student_id)
+        if not student:
+            return None
+
+        # Maktab bo'yicha reyting
+        school_board = self.get_leaderboard(limit=500)
+        school_rank = None
+        school_total = len(school_board)
+        student_data = None
+        for item in school_board:
+            if item['student_id'] == student_id:
+                school_rank = item['rank']
+                student_data = item
+                break
+
+        # Sinf bo'yicha reyting
+        class_board = self.get_leaderboard(class_name=student.get('class_name'), limit=200)
+        class_rank = None
+        class_total = len(class_board)
+        for item in class_board:
+            if item['student_id'] == student_id:
+                class_rank = item['rank']
+                break
+
+        return {
+            'student_id': student_id,
+            'student_name': student['name'],
+            'class_name': student.get('class_name', '5-sinf'),
+            'school_rank': school_rank or school_total,
+            'school_total': school_total,
+            'class_rank': class_rank or class_total,
+            'class_total': class_total,
+            'avg_grade': student_data['avg_grade'] if student_data else 0.0,
+            'grades_count': student_data['grades_count'] if student_data else 0,
+            'medal': student_data['medal'] if student_data else ''
+        }
 
     # ==================== Jadval ====================
 
